@@ -1,0 +1,94 @@
+# Sample configuration for osint-scraper.
+#
+# Copy to ./osint-scraper.yaml (or ~/.config/osint-scraper/config.yaml) and edit.
+# Every key below is shown with its built-in default.
+
+log_level: INFO
+manifest_name: manifest.jsonl
+
+crawl:
+  # Maximum posts per target. 0 means unlimited.
+  limit: 0
+  # Keep posts that carry no media (text-only posts) in the manifest.
+  include_text_only: false
+  platforms:
+    - instagram
+    - threads
+  user_agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36
+  # Hard ceiling applied after `limit`, so a runaway target cannot fill the disk.
+  max_posts_per_target: 5000
+  # Use the Threads GraphQL transport, which walks a profile's whole timeline
+  # instead of the 10-20 posts the server-rendered page carries.  The query id
+  # is discovered from the page at run time, so a bundle rotation is picked up
+  # automatically.  Turning this off falls back to the server-rendered page.
+  use_graphql: true
+  # How many GraphQL pages to walk per target.  Each page holds a handful of
+  # posts, so this is what bounds a run against a very long timeline.
+  max_pages: 100
+
+download:
+  directory: ./osint-output
+  # Simultaneous downloads.
+  concurrency: 4
+  # Minimum delay in seconds between requests to the same host.
+  delay: 1.8
+  # Extra random delay added on top of `delay`. Never use delay: 0 with jitter: 0 in production.
+  jitter: 2.7
+  retries: 3
+  timeout: 60.0
+  # Replace files that already exist instead of writing a new one alongside them.
+  overwrite: false
+  # Write a .json sidecar next to each post's media.
+  save_metadata: true
+  # Discard files smaller than this many bytes.
+  min_size: 1024
+
+cookies:
+  # Browser to take cookies from: brave, chrome, chromium, edge, firefox.
+  browser: brave
+  # Which profile to use: "Profile 1" or "flatpak:Profile 1".
+  # Empty (the default) merges every profile of the browser -- the session is
+  # usually in one profile and the rest of the cookies in the others.
+  profile: ""
+  # Restrict to one installation: system, flatpak or any.
+  source: any
+  # Also look inside Flatpak sandboxes under ~/.var/app/.
+  flatpak: true
+  # Domains cookies are exported for.
+  domains:
+    - instagram.com
+    - threads.net
+    - threads.com
+    - facebook.com
+  # Use an existing Netscape cookies.txt instead of extracting from a browser.
+  file: ""
+  # Where exported cookie files are written.
+  store_dir: ~/.cache/osint-scraper/cookies
+
+ratelimit:
+  # How long a host is left alone after it throttles us. The cooldown is persisted,
+  # so it also applies to the next run -- retrying through a throttle is what turns
+  # a rate limit into a spam flag.
+  cooldown_minutes: 60
+  # Where the cooldown state is stored.
+  file: ~/.cache/osint-scraper/cooldown.json
+  # Set to false to ignore cooldowns entirely (not recommended).
+  enabled: true
+
+history:
+  # Where the download history is kept. It records where every media file went
+  # and what its SHA-256 is, which is what makes a re-run cheap.
+  database: ~/.cache/osint-scraper/history.db
+  # Skip media that was already downloaded. Turn this off to force a fresh
+  # download of everything.
+  resume: true
+  # Re-hash a file that is already on disk and compare it with the recorded
+  # digest. A mismatch means the platform changed the media, so it is fetched
+  # again. Turning this off only compares file sizes, which is much cheaper.
+  verify: true
+  # Do not store the same content twice under different names. The media is
+  # then recorded as pointing at the copy that already exists.
+  dedupe: true
+  # Drop history entries whose file has been deleted from disk, so the next run
+  # knows to download them again.
+  prune: true

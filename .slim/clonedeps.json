@@ -1,0 +1,15 @@
+{
+  "version": "1.0.0",
+  "updatedAt": "2026-10-30T09:10:41.119Z",
+  "dependencies": [
+    {
+      "name": "cyberdrop-dl-patched",
+      "resolvedVersion": "10.14.0",
+      "repoUrl": "https://github.com/Cyberdrop-DL/cyberdrop-dl.git",
+      "ref": "10.14.0",
+      "path": ".slim/clonedeps/repos/Cyberdrop-DL__cyberdrop-dl",
+      "packagePath": "cyberdrop_dl",
+      "reason": "Architectural reference for the resume / file-check / hash-dedupe subsystem."
+    }
+  ]
+}
