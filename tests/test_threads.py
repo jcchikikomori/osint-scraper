@@ -556,16 +556,16 @@ def test_parse_target_recognises_every_form() -> None:
     assert post.share_url is None
     assert post.is_single_post
 
-    share = parse_target("https://www.threads.com/share/D-VhmZm13/")
-    assert share.post_code == "D-VhmZm13"
-    assert share.share_url == "https://www.threads.com/share/D-VhmZm13/"
+    share = parse_target("https://www.threads.com/share/HydvsaQAW/")
+    assert share.post_code == "HydvsaQAW"
+    assert share.share_url == "https://www.threads.com/share/HydvsaQAW/"
     assert share.is_single_post
 
 
 def test_normalize_target_refuses_a_share_link() -> None:
     """A share link's author is only known after the redirect."""
     with pytest.raises(UnsupportedTargetError, match="share link"):
-        normalize_target("https://www.threads.com/share/D-VhmZm13/")
+        normalize_target("https://www.threads.com/share/HydvsaQAW/")
 
 
 async def test_post_url_yields_only_that_post() -> None:

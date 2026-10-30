@@ -90,7 +90,7 @@ def _settings() -> Settings:
 def scrape(
     target: Annotated[
         list[str] | None,
-        typer.Argument(help="Target handles or profile URLs. Omit to use --platform with --target-file."),
+        typer.Argument(help="Target handles or profile URLs."),
     ] = None,
     platform: Annotated[
         list[str] | None,

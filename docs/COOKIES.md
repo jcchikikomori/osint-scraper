@@ -24,6 +24,32 @@ The export is a **Netscape `cookies.txt`** file. That format is accepted by ever
 this ecosystem — `instaloader --cookiefile`, `gallery-dl --cookies` and `yt-dlp --cookies` — so
 one artefact works everywhere.
 
+## Authenticated or anonymous
+
+Cookies are **optional**. Public Instagram posts and public Threads profiles need none. The
+browser session is what reaches **private profiles, stories, highlights and follow-gated
+content**.
+
+| | Anonymous (`--no-cookies`) | Authenticated (default) |
+| --- | --- | --- |
+| Public posts | Yes | Yes |
+| Private or follow-gated content | No — the platform refuses | Yes, with your session |
+| Stories and highlights | No | Yes |
+| Threads history | The most recent 10–20 posts | The whole timeline |
+| Reads your browser | No | Yes — the cookie database and the keyring |
+
+With cookies enabled, the Instagram crawler hands the browser's `instagram.com` cookies to
+`instaloader` so it authenticates the same way the browser does. Without a `sessionid` cookie
+it stays anonymous and says so in the log.
+
+Verified on a private profile: authenticated yields the posts and their carousels; anonymous
+raises `Login required to access the posts of private profile`.
+
+**`--no-cookies` is the more defensible posture** and it is worth understanding what it costs:
+you lose private content, stories, highlights and the deeper Threads history, and in exchange
+nothing is read out of your browser and no request is made on your behalf of an account that
+carries a session. For research over public material, it is usually the right default.
+
 ## Which profile?
 
 Browsers keep several profiles, and the logged-in one is usually not the one named `Default`.
@@ -193,6 +219,29 @@ When no profile is named in the config, the tool uses **every** profile of the b
 their cookies, preferring the profile with the strongest session when two hold the same cookie.
 You can pin a specific profile with `cookies.profile` in the config, or on the command line with
 `--profile "flatpak:Profile 1"`.
+
+## The cookie cache
+
+Reading and decrypting a browser's cookie database takes a moment, and the tool would
+otherwise do it on every run. The result is cached in the store directory.
+
+```bash
+osint-scraper scrape somehandle --no-cookie-cache   # force a fresh read
+```
+
+The cache is keyed on **the selection** — the browser, the profile and the source — so a cache
+written for one profile can never be served for another. Changing any of those yields a
+different cache file.
+
+| Property | Behaviour |
+| --- | --- |
+| Lifetime | `cookies.cache_ttl` seconds, 900 by default |
+| Expiry | Expired cookies are dropped on read and never served |
+| Corrupt file | Logged, and the browser is read again |
+| Bypass | `--no-cookie-cache`, or `cookies.use_cache: false` in the config |
+
+The cache is written with the same care as an export: mode `0600` for the file, `0700` for the
+store directory, applied at creation rather than afterwards.
 
 ## Safety notes
 
