@@ -31,7 +31,7 @@ DEFAULT_COOLDOWN_FILE = "~/.cache/osint-scraper/cooldown.json"
 """Where the cooldown state is persisted."""
 
 DEFAULT_COOLDOWN_MINUTES = 60.0
-"""Default cooldown applied when a platform signals throttling."""
+"""Default cooldown applied when a platform signals throttling, in minutes."""
 
 MIN_MULTIPLIER = 1.0
 """The pacing multiplier never drops below the configured baseline."""
@@ -207,7 +207,7 @@ class CooldownStore:
         state = self.state_for(host)
         state.strikes += 1
         state.multiplier = min(MAX_MULTIPLIER, max(MIN_MULTIPLIER, state.multiplier * 2))
-        cooldown = seconds if seconds is not None else DEFAULT_COOLDOWN_MINUTES
+        cooldown = seconds if seconds is not None else DEFAULT_COOLDOWN_MINUTES * 60
         state.cooldown_until = max(state.cooldown_until, time.time() + cooldown)
         logger.warning(
             "%s throttled us; pausing for %.0f s (pacing multiplier now %.1fx)",
@@ -254,6 +254,9 @@ class Pacer:
         store: Persistent cooldown state.
         base_delay: Minimum delay between requests to the same host.
         jitter: Extra random delay added on top of ``base_delay``.
+        cooldown_minutes: How long a host is left alone after it throttles us.
+        enabled: Whether cooldowns are enforced. When false a throttle is
+            logged but no cooldown is started, and an existing one is ignored.
     """
 
     def __init__(
@@ -262,6 +265,8 @@ class Pacer:
         *,
         base_delay: float = 1.8,
         jitter: float = 2.7,
+        cooldown_minutes: float = DEFAULT_COOLDOWN_MINUTES,
+        enabled: bool = True,
     ) -> None:
         """Create a pacer.
 
@@ -269,10 +274,15 @@ class Pacer:
             store: Persistent state. A new, empty store is created when omitted.
             base_delay: Minimum delay between requests to the same host.
             jitter: Extra random delay added on top of ``base_delay``.
+            cooldown_minutes: How long a host is left alone after it throttles
+                us. Fractional minutes are allowed.
+            enabled: Whether cooldowns are enforced at all.
         """
         self.store = store or CooldownStore.load()
         self.base_delay = base_delay
         self.jitter = jitter
+        self.cooldown_minutes = cooldown_minutes
+        self.enabled = enabled
         self._last_request: dict[str, float] = {}
 
     def delay_for(self, host: str) -> float:
@@ -296,8 +306,11 @@ class Pacer:
             host: Hostname.
 
         Returns:
-            The remaining cooldown in seconds.
+            The remaining cooldown in seconds, or ``0.0`` when cooldowns are
+            disabled.
         """
+        if not self.enabled:
+            return 0.0
         return self.store.cooldown_remaining(host)
 
     async def wait(self, url: str) -> None:
@@ -331,12 +344,23 @@ class Pacer:
 
         Args:
             url: The URL that was throttled.
-            seconds: Cooldown length, in seconds.
+            seconds: Cooldown length, in seconds. Defaults to the pacer's
+                configured ``cooldown_minutes``.
 
         Returns:
-            The cooldown that was applied, in seconds.
+            The cooldown that was applied, in seconds. Zero when cooldowns are
+            disabled.
         """
-        return self.store.register_throttle(host_of(url), seconds=seconds)
+        host = host_of(url)
+        if not self.enabled:
+            logger.warning(
+                "%s throttled us, but cooldowns are disabled; continuing anyway",
+                host,
+            )
+            return 0.0
+        if seconds is None:
+            seconds = self.cooldown_minutes * 60
+        return self.store.register_throttle(host, seconds=seconds)
 
     def on_success(self, url: str) -> None:
         """Record a successful exchange with the host of ``url``.

@@ -34,7 +34,7 @@ instagram = [
 ]
 # Browser cookie extraction. Kept optional so the core CLI works without them.
 cookies = [
-  "secretstorage>=3.3.3; sys_platform != 'darwin'",
+  "secretstorage>=3.5; sys_platform != 'darwin'",
 ]
 # Video transport fallback (DASH merging for IG/FB videos).
 media = [

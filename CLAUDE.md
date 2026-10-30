@@ -67,7 +67,53 @@ Treat them as facts, not as guesses to re-litigate.
 - **A private profile is reachable with the session and not without.** Verified: authenticated
   yields the posts and their carousels, anonymous raises `LoginRequiredException`.
 - **`gallery-dl` 1.32.18 is currently broken** for Instagram — `NotFoundError: Requested user
-  could not be found`. It is the intended secondary engine but cannot be relied on.
+  could not be found`, from a `KeyError` on the query id. It is the intended secondary engine but
+  cannot be relied on.
+- **The root cause is gallery-dl's page fetch, not its mining.** gallery-dl already mines the
+  `doc_id` at run time from the JS bundles — the same trick the Threads transport uses. But it
+  requests the profile with `Sec-Fetch-Site: none` / `Sec-Fetch-Mode: navigate`, and **Instagram
+  answers that request with a page carrying no JS bundle references at all** (778 KB, zero `.js`
+  URLs). The same URL fetched with a plain user agent returns 512 KB with six bundles, and
+  `PolarisProfilePageContentQuery` mines out of them with its doc id. So the technique is proven
+  on Instagram too; only gallery-dl's headers are wrong.
+- **The Instagram query id is mineable at run time, exactly like the Threads one.** From a plain
+  user-agent profile page, the bundles under `static.cdninstagram.com/rsrc.php/` carry
+  `__d("<Name>_instagramRelayOperation",[],…exports="<doc_id>")`. Verified:
+  `PolarisProfilePageContentQuery` → a live doc id. The bundle URLs appear as both
+  `<link href=…>` and `<script src=…>`, so a scraper must not look for only one.
+- **`get_stories()` and `get_highlights()` live on the `Instaloader` class, not on `Profile`.**
+  They are present in 4.16 and were never removed; only the `has_viewable_story` /
+  `has_highlight_reels` *flags* are deprecated. `get_tagged_posts()` is **target**-scoped (the
+  posts the target is tagged in), while `get_saved_posts()` is self-scoped and needs a login as
+  that profile.
+- **The Instagram surfaces are reached through the iPhone API**, and they work:
+  - stories — `api/v1/feed/reels_media/?reel_ids=<userid>` → `reels[<userid>]["items"]`
+  - highlights — `api/v1/highlights/<userid>/highlights_tray/` → `tray[]` (each entry's `id` is
+    `"highlight:<numeric>"`, and its `items` list is empty), then per highlight
+    `api/v1/feed/reels_media/?reel_ids=highlight:<numeric>` → the items
+  - The web `api/v1/feed/reels_tray/` endpoint answers with **HTML** without the `Sec-Fetch-*`
+    script headers, and instaloader 4.16 has no `get_web_api_json` — that is why the iPhone API
+    is used instead.
+- **A story or highlight item's `media_type` is 1 (image) or 2 (video).** A video item's
+  `image_versions2` is its **poster frame**, not a second media object. Its `video_versions`
+  holds three entries that share one URL and differ only in `type` (101 is the video);
+  `101` is the one to take, with the highest bandwidth as the fallback.
+- **IGTV is broken upstream**: `profile.get_igtv_posts()` raises `KeyError: 'edges'` because the
+  GraphQL response shape changed. It is a generator, so the error surfaces during iteration.
+- **Some instaloader accessors fetch eagerly.** `profile.get_posts()` and
+  `profile.get_tagged_posts()` read the profile's metadata *before* returning an iterator, and
+  building a post can fetch a post's full metadata when its node is partial. Both paths make
+  network requests, so both have to sit inside the guard that translates a throttle into a
+  `RateLimitError` — otherwise the raw instaloader exception escapes and no cooldown is
+  registered.
+- **A carousel child's identity lives in the parent's node, not in instaloader's child objects.**
+  The parent carries a `carousel_media` list whose entries hold the child's own media id, media
+  type and dimensions; instaloader's `get_sidecar_nodes()` hands back thin objects with only
+  `display_url`, `video_url` and `is_video`. **The parent carries `carousel_media` only for
+  anonymous reads** — an authenticated profile feed returns thin children instead, so an
+  authenticated scrape yields the child's URL and kind but no media id and no dimensions. That is
+  the platform's shape, not a bug in the crawler; fetching the post's full metadata would cost
+  an extra GraphQL request per carousel, which the account-level throttle does not allow.
 - **Instagram throttles per *account*, not per IP.** When it does, the response is HTTP 400 with
   `{"message": "feedback_required", "spam": true}` — while anonymous requests from the same IP
   keep working. That asymmetry is the tell.
@@ -85,13 +131,12 @@ Treat them as facts, not as guesses to re-litigate.
   both `pk` and `code` plus one of `caption`, `image_versions2`, `video_versions`,
   `text_post_app_info` — never by a fixed JSON path. A refactor should degrade the results, not
   zero them.
-- **The GraphQL transport does not work.** `POST /api/graphql` needs a `doc_id` that Meta rotates
-  frequently; the known values are stale. Do not hardcode one. Auto-discovery from the live JS
-  bundle is the planned fix (roadmap M2 / risk R2).
-- **The GraphQL transport DOES work — but only anonymously.** `POST /api/graphql` with the
+- **The GraphQL transport works — but only anonymously.** `POST /api/graphql` with the
   `doc_id` and variables mined from the server-rendered page's `expectedPreloaders` manifest
   pages the whole timeline: **215 posts for `@somehandle` (2023-08-03 → 2026-10-13)** against 10
-  through the page. Three facts that cost live requests to establish:
+  through the page. `doc_id` rotates whenever Meta ships a bundle, so it must **never** be
+  hardcoded — mining it from the page is what makes a rotation a non-event. Facts that cost
+  live requests to establish:
   - The `doc_id` and the query's **exact variables** live in the page's
     `"expectedPreloaders"` array. Mining them means a bundle rotation is picked up automatically.
     Copy the variables **verbatim** — they carry ~50 feature flags that change with the bundle.
@@ -137,8 +182,19 @@ Treat them as facts, not as guesses to re-litigate.
 - **Chromium `v11`**: same derivation but the password comes from the keyring.
 - **The decrypted plaintext starts with a 32-byte integrity prefix** that must be stripped.
   Skipping it yields plausible-looking garbage — this is the classic "why won't it decrypt" bug.
-- **`v12` (Flatpak SecretPortal) cannot be decrypted by any third-party tool.** Detect it and say
-  so; the fix is launching the browser with `--password-store=basic` so it writes `v10`.
+- **`v12` (Flatpak SecretPortal) is decryptable.** The old note in this file said it was not,
+  which was wrong. `v12` is Chromium's `os_crypt_async` SecretPortal scheme: HKDF-SHA256 with
+  salt `fdo_portal_secret_salt` and info `HKDF-SHA-256 AES-256-GCM` into a 32-byte key, then
+  **AES-256-GCM** with a 12-byte nonce and a 16-byte tag, behind the same 32-byte integrity
+  prefix as v10/v11. The portal secret is persisted in the **host** keyring (KWallet folder
+  `xdg-desktop-portal`, entry named after the Flatpak app ID) and a Secret Service client can
+  read it — `secret-tool` refuses only because the entry is **binary**.
+- **`v12` is not Flatpak-exclusive in principle**, and the encryption flag is off by default in
+  current Chromium, so most machines have no `v12` cookies at all.
+- **Two pieces of advice that were wrong:** `chrome://flags` has no `#password-store-basic`
+  option, and `flatpak override --env=CHROME_PASSWORD_STORE=basic` cannot work because the
+  switch is argv-only. The real remediation is to launch the browser with `--password-store=basic`
+  as a command-line switch; **no profile deletion is needed**, only re-authentication.
 - **A desktop can hold several keyring entries under one key.** On this KDE machine the plain
   `secret-tool lookup server "Brave Keys" user "Brave Safe Storage"` returns a *stale* secret
   while the same lookup plus `xdg:schema org.qt.keychain` returns the live one. Collect every
@@ -190,7 +246,8 @@ src/osint_scraper/
 ├── crawlers/
 │   ├── base.py          # Crawler ABC, CrawlContext, registry
 │   ├── instagram.py     # instaloader
-│   └── threads.py       # public profile SSR
+│   ├── threads.py       # Threads crawler: GraphQL timeline, single posts, SSR fallback
+│   └── threads_api.py   # the Threads transport: user agents, GraphQL session, its pages
 ├── downloader.py        # concurrent, paced, hashed downloads; resume, file check, dedupe
 ├── database.py          # SQLite history: media index, content index, seen posts
 ├── manifest.py          # JSONL audit trail
@@ -245,5 +302,8 @@ deliberately.
 
 ## Collected identifiers
 
-The usernames, account ids and session metadata scraped from the operator's machine are recorded
-in `docs/TARGETS.md`. Update it when new identifiers are collected.
+`docs/TARGETS.md` records **what the cookie subsystem can reach** — which cookie carries the
+session, which browser profile holds it, which keyring entry actually decrypts. The handles and
+numeric account ids themselves are deliberately **not** in the repository: a repo is not the place
+to keep the operator's own identifiers. Keep it that way when new identifiers are collected —
+record the structure, not the names.

@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from osint_scraper.ratelimit import (
+    DEFAULT_COOLDOWN_MINUTES,
     MAX_MULTIPLIER,
     CooldownStore,
     HostState,
@@ -21,6 +22,54 @@ from osint_scraper.ratelimit import (
     host_of,
     looks_throttled,
 )
+
+
+def test_default_cooldown_is_in_minutes_not_seconds(tmp_path: Path) -> None:
+    """The default cooldown is 60 minutes, not 60 seconds.
+
+    The constant is named in minutes, so using it as a seconds count made the
+    cooldown sixty times shorter than it claimed -- and an account-level
+    throttle needs minutes, not seconds.
+    """
+    store = CooldownStore(path=tmp_path / "cooldown.json")
+    applied = store.register_throttle("instagram.com")
+
+    assert applied == DEFAULT_COOLDOWN_MINUTES * 60
+    remaining = store.cooldown_remaining("instagram.com")
+    assert DEFAULT_COOLDOWN_MINUTES * 60 - 5 < remaining <= DEFAULT_COOLDOWN_MINUTES * 60
+
+
+def test_pacer_uses_the_configured_cooldown_length(tmp_path: Path) -> None:
+    """The pacer's ``cooldown_minutes`` decides how long a host is left alone."""
+    store = CooldownStore(path=tmp_path / "cooldown.json")
+    pacer = Pacer(store, cooldown_minutes=15)
+
+    applied = pacer.on_throttled("https://www.instagram.com/somehandle/")
+
+    assert applied == 900
+    assert pacer.cooldown_remaining("instagram.com") > 0
+
+
+def test_pacer_can_disable_cooldowns(tmp_path: Path) -> None:
+    """With cooldowns disabled a throttle is logged but nothing is recorded."""
+    store = CooldownStore(path=tmp_path / "cooldown.json")
+    pacer = Pacer(store, enabled=False)
+
+    applied = pacer.on_throttled("https://www.instagram.com/somehandle/")
+
+    assert applied == 0
+    assert pacer.cooldown_remaining("instagram.com") == 0
+    assert store.cooldown_remaining("instagram.com") == 0
+
+
+def test_pacer_ignores_an_existing_cooldown_when_disabled(tmp_path: Path) -> None:
+    """A cooldown recorded earlier is not honoured while the switch is off."""
+    store = CooldownStore(path=tmp_path / "cooldown.json")
+    store.register_throttle("instagram.com", seconds=600)
+
+    pacer = Pacer(store, enabled=False)
+
+    assert pacer.cooldown_remaining("instagram.com") == 0
 
 
 def test_host_of_extracts_the_hostname() -> None:

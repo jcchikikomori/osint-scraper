@@ -37,7 +37,7 @@ from osint_scraper.crawlers.threads_api import (
     profile_url,
 )
 from osint_scraper.exceptions import AuthError, ParseError, RateLimitError, UnsupportedTargetError
-from osint_scraper.models import MediaRef, Post, ProfileInfo
+from osint_scraper.models import MediaRef, Post, ProfileInfo, stamp_indices
 
 __all__ = [
     "THREADS_USER_AGENTS",
@@ -58,6 +58,10 @@ _SCRIPT_JSON_RE = re.compile(
     r'<script\s+type=["\']application/json["\'][^>]*>(.*?)</script>',
     re.DOTALL | re.IGNORECASE,
 )
+
+
+_SSR_TRUNCATION = "Threads unauthenticated profile pages return roughly the 10-20 most recent posts"
+"""Why a server-rendered profile result is incomplete."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,8 +239,45 @@ def _normalize_url(url: str) -> str:
     return url.replace("\\/", "/")
 
 
-def _best_image(candidates: list[Any]) -> MediaRef | None:
-    """Pick the highest-resolution image candidate."""
+def _media_id_from_raw(raw: dict[str, Any]) -> str | None:
+    """Return the post's own ``pk`` as a media id, when it carries one.
+
+    Args:
+        raw: A Threads post dict.
+
+    Returns:
+        The ``pk`` as a string, or ``None`` when it is missing.
+    """
+    return _string_id(raw.get("pk"))
+
+
+def _string_id(value: Any) -> str | None:
+    """Return ``value`` as a non-empty id string, or ``None``.
+
+    Args:
+        value: A platform identifier, usually an ``int`` or a ``str``.
+
+    Returns:
+        The identifier as a string when it is usable, otherwise ``None``.
+    """
+    if isinstance(value, str) and value:
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return None
+
+
+def _best_image(candidates: list[Any], *, media_id: str | None = None) -> MediaRef | None:
+    """Pick the highest-resolution image candidate.
+
+    Args:
+        candidates: The ``image_versions2.candidates`` list.
+        media_id: The platform's id for the media object, when known.
+
+    Returns:
+        The best candidate as a :class:`MediaRef`, or ``None`` when there is no
+        usable candidate.
+    """
     best: dict[str, Any] | None = None
     best_size = -1
     for candidate in candidates:
@@ -257,11 +298,21 @@ def _best_image(candidates: list[Any]) -> MediaRef | None:
         height=best.get("height"),
         mime="image/jpeg",
         extension=".jpg",
+        media_id=media_id,
     )
 
 
-def _best_video(versions: list[Any]) -> MediaRef | None:
-    """Pick the highest-quality video version."""
+def _best_video(versions: list[Any], *, media_id: str | None = None) -> MediaRef | None:
+    """Pick the highest-quality video version.
+
+    Args:
+        versions: The ``video_versions`` list.
+        media_id: The platform's id for the media object, when known.
+
+    Returns:
+        The best version as a :class:`MediaRef`, or ``None`` when there is no
+        usable version.
+    """
     best: dict[str, Any] | None = None
     best_size = -1
     best_bandwidth = -1
@@ -285,26 +336,38 @@ def _best_video(versions: list[Any]) -> MediaRef | None:
         height=best.get("height"),
         mime="video/mp4",
         extension=".mp4",
+        media_id=media_id,
     )
 
 
 def _media_from_post(raw: dict[str, Any]) -> list[MediaRef]:
-    """Return media refs for a single Threads post dict."""
+    """Return media refs for a single Threads post dict.
+
+    Every ref carries its zero-based position and, where the payload provides
+    one, the platform's own id for that media object.
+
+    Args:
+        raw: A Threads post dict.
+
+    Returns:
+        The post's media references in the order the post presents them.
+    """
     media: list[MediaRef] = []
+    post_media_id = _media_id_from_raw(raw)
 
     # A video post with a poster frame is still a video post.
     video_versions = raw.get("video_versions")
     if isinstance(video_versions, list) and video_versions:
-        video = _best_video(video_versions)
+        video = _best_video(video_versions, media_id=post_media_id)
         if video is not None:
             media.append(video)
-            return media
+            return stamp_indices(media)
 
     image_versions2 = raw.get("image_versions2")
     if isinstance(image_versions2, dict):
         candidates = image_versions2.get("candidates")
         if isinstance(candidates, list) and candidates:
-            image = _best_image(candidates)
+            image = _best_image(candidates, media_id=post_media_id)
             if image is not None:
                 media.append(image)
 
@@ -313,9 +376,10 @@ def _media_from_post(raw: dict[str, Any]) -> list[MediaRef]:
         for child in carousel_media:
             if not isinstance(child, dict):
                 continue
+            child_media_id = _string_id(child.get("pk"))
             child_video = child.get("video_versions")
             if isinstance(child_video, list) and child_video:
-                video = _best_video(child_video)
+                video = _best_video(child_video, media_id=child_media_id)
                 if video is not None:
                     media.append(video)
                     continue
@@ -323,11 +387,11 @@ def _media_from_post(raw: dict[str, Any]) -> list[MediaRef]:
             if isinstance(child_images, dict):
                 candidates = child_images.get("candidates")
                 if isinstance(candidates, list) and candidates:
-                    image = _best_image(candidates)
+                    image = _best_image(candidates, media_id=child_media_id)
                     if image is not None:
                         media.append(image)
 
-    return media
+    return stamp_indices(media)
 
 
 def _permalink_from_raw(raw: dict[str, Any], fallback_username: str) -> str:
@@ -428,6 +492,12 @@ def _attach_quoted(
     if isinstance(nested, dict):
         _attach_quoted(parent, nested, seen, is_direct=False)
 
+    # Attaching extends the parent's list, so the positions stamped by
+    # ``_media_from_post`` no longer describe the combined list. Re-stamp after
+    # every attach -- including the recursive ones above -- so the final list is
+    # contiguous 0..n-1 with no gaps or duplicates.
+    parent.media[:] = stamp_indices(parent.media)
+
 
 @register_crawler
 class ThreadsCrawler(Crawler):
@@ -469,15 +539,14 @@ class ThreadsCrawler(Crawler):
         """
         parsed = parse_target(target)
 
+        truncation_reason: str | None = None
         if parsed.share_url is not None:
             username, entries = await self._fetch_shared_post(parsed.share_url)
-            truncated = False
         elif parsed.post_code is not None:
             username, entries = await self._fetch_single_post(parsed.username, parsed.post_code)
-            truncated = False
         else:
             username = parsed.username
-            entries, truncated = await self._fetch_profile_posts(username, limit)
+            entries, truncation_reason = await self._fetch_profile_posts(username, limit)
 
         # Attach quoted-post media to the quoting parent. Quoted posts from
         # other accounts are not emitted as top-level posts.
@@ -489,21 +558,20 @@ class ThreadsCrawler(Crawler):
                 _attach_quoted(post, quoted_raw, set())
 
         top_level = [post for post, _raw in entries]
-        if truncated:
+        if truncation_reason is None:
+            self.log.info("Threads returned %d post(s) for @%s", len(top_level), username)
+        else:
             self.log.info(
-                "Threads returned %d post(s) for @%s (platform-imposed ceiling ~10-20 posts)",
+                "Threads returned %d post(s) for @%s (incomplete: %s)",
                 len(top_level),
                 username,
+                truncation_reason,
             )
-        else:
-            self.log.info("Threads returned %d post(s) for @%s", len(top_level), username)
 
         for yielded, post in enumerate(top_level, start=1):
-            if truncated:
+            if truncation_reason is not None:
                 post.metadata["truncated"] = True
-                post.metadata["truncation_reason"] = (
-                    "Threads unauthenticated profile pages return roughly the 10-20 most recent posts"
-                )
+                post.metadata["truncation_reason"] = truncation_reason
             if limit is not None and yielded > limit:
                 self.log.debug("Reached limit of %d post(s)", limit)
                 break
@@ -511,7 +579,7 @@ class ThreadsCrawler(Crawler):
 
     async def _fetch_profile_posts(
         self, username: str, limit: int | None = None
-    ) -> tuple[list[tuple[Post, dict[str, Any]]], bool]:
+    ) -> tuple[list[tuple[Post, dict[str, Any]]], str | None]:
         """Fetch the posts of a profile.
 
         The GraphQL transport reaches the whole timeline; the server-rendered
@@ -525,8 +593,8 @@ class ThreadsCrawler(Crawler):
 
         Returns:
             The posts authored by ``username``, each paired with its raw dict,
-            and whether the result is truncated by the platform's rendering
-            ceiling.
+            and the reason the result is incomplete -- ``None`` when it is
+            complete.
         """
         if self.ctx.settings.crawl.use_graphql:
             # The GraphQL timeline query must be *anonymous*.  A logged-in
@@ -543,9 +611,9 @@ class ThreadsCrawler(Crawler):
                     "the Threads GraphQL transport failed (%s); falling back to the profile page",
                     exc,
                 )
-                return await self._fetch_ssr_posts(username), True
+                return await self._fetch_ssr_posts(username), _SSR_TRUNCATION
             try:
-                entries = await self._fetch_graphql_posts(username, session, limit)
+                entries, hit_ceiling = await self._fetch_graphql_posts(username, session, limit)
             except ThreadsGraphQLError as exc:
                 self.log.warning(
                     "the Threads GraphQL transport failed (%s); falling back to the profile page",
@@ -558,18 +626,23 @@ class ThreadsCrawler(Crawler):
                 )
             else:
                 if entries:
-                    return entries, False
+                    if hit_ceiling:
+                        return entries, (
+                            f"the run stopped at the {self.ctx.settings.crawl.max_pages}-page "
+                            "ceiling, so the timeline is incomplete"
+                        )
+                    return entries, None
                 self.log.warning(
                     "the Threads GraphQL transport returned no posts for @%s; "
                     "falling back to the profile page",
                     username,
                 )
-            return await self._fetch_ssr_posts(username), True
-        return await self._fetch_ssr_posts(username), True
+            return await self._fetch_ssr_posts(username), _SSR_TRUNCATION
+        return await self._fetch_ssr_posts(username), _SSR_TRUNCATION
 
     async def _fetch_graphql_posts(
         self, username: str, session: ThreadsGraphQLSession, limit: int | None = None
-    ) -> list[tuple[Post, dict[str, Any]]]:
+    ) -> tuple[list[tuple[Post, dict[str, Any]]], bool]:
         """Page a profile's whole timeline over the GraphQL transport.
 
         The cursor chain is strictly sequential -- each page names the next --
@@ -581,7 +654,8 @@ class ThreadsCrawler(Crawler):
             limit: Stop once this many posts have been collected.
 
         Returns:
-            The posts authored by ``username``, each paired with its raw dict.
+            The posts authored by ``username``, each paired with its raw dict,
+            and whether the page budget ran out before the timeline did.
 
         Raises:
             ParseError: When the profile is private.
@@ -592,6 +666,7 @@ class ThreadsCrawler(Crawler):
         entries: list[tuple[Post, dict[str, Any]]] = []
         cursor: str | None = None
         refreshed = False
+        hit_ceiling = False
 
         for page_number in range(1, max_pages + 1):
             await self._apply_politeness()
@@ -646,8 +721,18 @@ class ThreadsCrawler(Crawler):
             cursor = info.get("end_cursor")
             if not cursor or not fresh:
                 break
+        else:
+            # The loop ran out of pages without the server saying there was no
+            # more.  The timeline was cut short, and the caller has to say so
+            # rather than report an incomplete result as a complete one.
+            hit_ceiling = True
+            self.log.warning(
+                "stopped at the %d-page ceiling for @%s; the timeline is incomplete",
+                max_pages,
+                username,
+            )
 
-        return entries
+        return entries, hit_ceiling
 
     async def _fetch_ssr_posts(
         self, username: str, html: str | None = None

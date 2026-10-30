@@ -4,25 +4,47 @@ from __future__ import annotations
 
 import asyncio
 import configparser
+import hashlib
 import logging
 import os
 import shutil
 import sqlite3
 import subprocess
 import tempfile
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from osint_scraper.config.settings import CookieSettings
+from osint_scraper.config.settings import DEFAULT_COOKIE_CACHE_TTL, CookieSettings
 from osint_scraper.exceptions import CookieError
 
 logger = logging.getLogger("osint_scraper.cookies")
 
 _CHROME_EPOCH_DIFF = 11644473600000000
+
+_STORE_DIR_MODE = 0o700
+"""Mode of the cookie store directory and of any directory this module creates."""
+
+_COOKIE_FILE_MODE = 0o600
+"""Mode of every cookie file written by this module: owner read/write only."""
+
+DEFAULT_CACHE_TTL_SECONDS: float = DEFAULT_COOKIE_CACHE_TTL
+"""How long an extracted cookie cache is reused before the browser is read again.
+
+Fifteen minutes is deliberately short. The cost of a stale cache is a run that
+scrapes with a session the browser has already replaced (after a re-login), so
+the window has to stay small; the benefit -- not decrypting the whole cookie
+database on every invocation -- does not need a long window, because a cache
+written a minute ago is already reused by the next run.
+"""
+
+_CACHE_FORMAT_VERSION = 1
+"""Bumped when the cache layout changes, so old files are never re-used."""
 
 _BROWSER_CONFIG: dict[str, dict[str, str]] = {
     "brave": {
@@ -151,6 +173,27 @@ def _expand(path: str) -> Path:
 def _profile_sort_key(name: str) -> tuple[int, str]:
     """Sort ``Default`` first, then alphabetically."""
     return (0 if name == "Default" else 1, name)
+
+
+def _flatpak_app_id(cookie_db: Path) -> str | None:
+    """Return the Flatpak app ID that owns ``cookie_db``, when there is one.
+
+    Flatpak profiles live under ``~/.var/app/<APP_ID>/...``. Parsing the ID out
+    of the profile path is more robust than a hardcoded browser table: it is
+    already the path the profile was discovered under, and it covers forks and
+    renamed app IDs that a table would miss.
+
+    Args:
+        cookie_db: Path to a browser's ``Cookies`` database.
+
+    Returns:
+        The app ID, or ``None`` when the path is not inside a Flatpak sandbox.
+    """
+    parts = cookie_db.parts
+    for index, part in enumerate(parts):
+        if part == "app" and index > 0 and parts[index - 1] == ".var" and index + 1 < len(parts):
+            return parts[index + 1]
+    return None
 
 
 def _chromium_profiles(base: Path) -> list[str]:
@@ -312,9 +355,288 @@ def _encrypt_v11(plaintext: bytes, password: bytes) -> bytes:
     return b"v11" + ciphertext
 
 
+_V12_KEY_LENGTH = 32
+"""Length of the AES-256-GCM key Chromium derives from the portal secret."""
+
+_V12_NONCE_LENGTH = 12
+"""AES-GCM nonce length. Chromium stores the nonce before the ciphertext."""
+
+_V12_TAG_LENGTH = 16
+"""AES-GCM authentication tag length, appended after the ciphertext."""
+
+_V12_HKDF_SALT = b"fdo_portal_secret_salt"
+"""HKDF salt from Chromium's ``SecretPortalKeyProvider``."""
+
+_V12_HKDF_INFO = b"HKDF-SHA-256 AES-256-GCM"
+"""HKDF info from Chromium's ``SecretPortalKeyProvider``.
+
+Upstream: ``components/os_crypt/async/browser/secret_portal_key_provider.cc``.
+Either constant being wrong yields a key that silently decrypts nothing, so they
+are pinned by a test.
+"""
+
+_PORTAL_ATTRIBUTE_SERVER = "xdg-desktop-portal"
+"""Secret Service ``server`` attribute used by the portal's secret backend."""
+
+
+def _derive_v12_key(portal_secret: bytes) -> bytes:
+    """Derive the ``v12`` AES-256-GCM key from a SecretPortal secret.
+
+    Chromium runs RFC 5869 HKDF-SHA256 over the raw portal secret; the output is
+    a 32-byte AES-256 key.
+
+    Args:
+        portal_secret: The raw bytes the portal returned for the app.
+
+    Returns:
+        The 32-byte key used to decrypt that app's ``v12`` values.
+    """
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    kdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=_V12_KEY_LENGTH,
+        salt=_V12_HKDF_SALT,
+        info=_V12_HKDF_INFO,
+    )
+    return kdf.derive(portal_secret)
+
+
+def _decrypt_v12(ciphertext: bytes, key: bytes) -> bytes:
+    """Decrypt a ``v12`` payload with AES-256-GCM.
+
+    The payload is ``nonce || ciphertext || tag`` with no associated data. The
+    result still carries the 32-byte integrity prefix the caller must strip.
+
+    Args:
+        ciphertext: The blob after the three-byte ``b"v12"`` prefix.
+        key: A 32-byte key from :func:`_derive_v12_key`.
+
+    Returns:
+        The decrypted plaintext.
+
+    Raises:
+        ValueError: When the payload is too short to hold a nonce and a tag.
+        cryptography.exceptions.InvalidTag: When ``key`` did not encrypt this
+            payload.
+    """
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    if len(ciphertext) < _V12_NONCE_LENGTH + _V12_TAG_LENGTH:
+        raise ValueError("v12 payload is too short to hold a nonce and a tag")
+    nonce = ciphertext[:_V12_NONCE_LENGTH]
+    body = ciphertext[_V12_NONCE_LENGTH:]
+    return AESGCM(key).decrypt(nonce, body, None)
+
+
+def _encrypt_v12(plaintext: bytes, portal_secret: bytes) -> bytes:
+    """Encrypt a value using the Chromium ``v12`` scheme (for tests)."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    key = _derive_v12_key(portal_secret)
+    nonce = os.urandom(_V12_NONCE_LENGTH)
+    payload = b"\x00" * 32 + plaintext
+    return b"v12" + nonce + AESGCM(key).encrypt(nonce, payload, None)
+
+
+class _PortalKeyUnavailableError(Exception):
+    """The SecretPortal secret could not be read from the host keyring.
+
+    A private control-flow signal: callers turn it into a cookie warning so a
+    missing or locked keyring never aborts an extraction.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class _PortalKeySet:
+    """The ``v12`` candidate keys for one profile, or why there are none.
+
+    Attributes:
+        keys: Derived AES-256-GCM keys, one per portal secret the keyring holds.
+        reason: Human-readable reason ``keys`` is empty, or ``None`` on success.
+    """
+
+    keys: tuple[bytes, ...] = ()
+    reason: str | None = None
+
+
+def _portal_secrets_from_keyring(app_id: str) -> tuple[bytes, ...]:
+    """Read the SecretPortal secret(s) for ``app_id`` from the host keyring.
+
+    The xdg-desktop-portal Secret backend keeps one binary secret per sandboxed
+    application in the host secret service. On KDE that is the KWallet folder
+    ``xdg-desktop-portal`` with the app ID as the entry name; GNOME Keyring and
+    other backends expose it through the same ``org.freedesktop.secrets``
+    attributes. ``secret-tool`` refuses these entries because the secret is
+    binary, so the lookup goes through ``secretstorage``, which returns raw
+    bytes.
+
+    Locked entries are skipped rather than unlocked: unlocking can pop a desktop
+    prompt, which would hang an unattended scrape.
+
+    Args:
+        app_id: The Flatpak application ID, e.g. ``"com.google.Chrome"``.
+
+    Returns:
+        Every distinct secret stored for ``app_id``, in keyring order. Empty when
+        the keyring holds none.
+
+    Raises:
+        _PortalKeyUnavailableError: When ``secretstorage`` is not installed, the
+            session bus cannot be reached, or the entries cannot be read.
+    """
+    try:
+        import secretstorage
+    except ImportError as exc:
+        raise _PortalKeyUnavailableError(
+            "the optional 'secretstorage' package is not installed; install the "
+            "'cookies' extra to read SecretPortal keys"
+        ) from exc
+
+    try:
+        connection = secretstorage.dbus_init()
+    except Exception as exc:
+        raise _PortalKeyUnavailableError(f"the session D-Bus is unavailable: {exc}") from exc
+
+    secrets: list[bytes] = []
+    locked = 0
+    errors: list[str] = []
+    try:
+        items = secretstorage.search_items(
+            connection,
+            {"server": _PORTAL_ATTRIBUTE_SERVER, "user": app_id},
+        )
+        for item in items:
+            try:
+                if item.is_locked():
+                    locked += 1
+                    continue
+                secret = item.get_secret()
+            except Exception as exc:
+                errors.append(str(exc))
+                continue
+            if secret and secret not in secrets:
+                secrets.append(secret)
+    except Exception as exc:
+        raise _PortalKeyUnavailableError(f"could not search the host keyring: {exc}") from exc
+    finally:
+        try:
+            connection.close()
+        except Exception as exc:
+            logger.debug("could not close the secret service connection: %s", exc)
+
+    if secrets:
+        return tuple(secrets)
+    if locked:
+        raise _PortalKeyUnavailableError(f"the keyring entry for app {app_id!r} is locked")
+    if errors:
+        raise _PortalKeyUnavailableError(f"could not read the keyring entry for app {app_id!r}: {errors[0]}")
+    return ()
+
+
+class _PortalKeyCache:
+    """Read SecretPortal secrets lazily, once per app ID and process.
+
+    The lookup costs a D-Bus round trip to the secret service, so it only runs
+    when a ``v12`` value is actually encountered, and both success and failure
+    are cached for the lifetime of the process. Caching a failure is deliberate:
+    an unavailable keyring would otherwise be re-probed for every ``v12`` cookie
+    in the database.
+    """
+
+    def __init__(self) -> None:
+        """Create an empty cache."""
+        self._sets: dict[str | None, _PortalKeySet] = {}
+
+    def keys_for(self, app_id: str | None) -> _PortalKeySet:
+        """Return the candidate ``v12`` keys for ``app_id``, reading them once.
+
+        Args:
+            app_id: The Flatpak application ID, or ``None`` when the profile is
+                not inside a Flatpak sandbox.
+
+        Returns:
+            The cached key set. ``keys`` is empty when the secret is unavailable,
+            and ``reason`` says why.
+        """
+        if app_id not in self._sets:
+            self._sets[app_id] = self._read(app_id)
+        return self._sets[app_id]
+
+    def clear(self) -> None:
+        """Forget every cached result, so the keyring is read again."""
+        self._sets.clear()
+
+    @staticmethod
+    def _read(app_id: str | None) -> _PortalKeySet:
+        """Read one app's keys, turning every failure into a warning reason."""
+        if app_id is None:
+            return _PortalKeySet(
+                reason=(
+                    "the profile is not inside a Flatpak sandbox, so its SecretPortal "
+                    "app ID cannot be derived from the path"
+                )
+            )
+        try:
+            secrets = _portal_secrets_from_keyring(app_id)
+        except _PortalKeyUnavailableError as exc:
+            logger.debug("SecretPortal secret for %s is unavailable: %s", app_id, exc)
+            return _PortalKeySet(reason=str(exc))
+        if not secrets:
+            return _PortalKeySet(
+                reason=(
+                    f"no '{_PORTAL_ATTRIBUTE_SERVER}' secret for app {app_id!r} was found in the host keyring"
+                )
+            )
+        return _PortalKeySet(keys=tuple(_derive_v12_key(secret) for secret in secrets))
+
+
+_PORTAL_KEY_CACHE = _PortalKeyCache()
+"""The process-wide cache the cookie loader shares across profiles."""
+
+
+def _decrypt_v12_cookie(
+    ciphertext: bytes,
+    v12_keys: Callable[[], _PortalKeySet] | None,
+) -> tuple[str | None, str | None]:
+    """Decrypt a ``v12`` payload with lazily fetched portal keys.
+
+    Every candidate is tried and the first one that passes the GCM tag check
+    wins, matching how the ``v11`` path copes with a desktop holding several
+    keyring entries.
+
+    Args:
+        ciphertext: The blob after the three-byte ``b"v12"`` prefix.
+        v12_keys: Lazy source of candidate keys, or ``None`` when no lookup is
+            available.
+
+    Returns:
+        A ``(value, warning)`` tuple, as :func:`_decrypt_chromium_value`.
+    """
+    if v12_keys is None:
+        return None, (
+            "v12 (SecretPortal) cookie could not be decrypted: no portal secret lookup is available"
+        )
+    candidates = v12_keys()
+    last_error: Exception | None = None
+    for key in candidates.keys:
+        try:
+            plaintext = _decrypt_v12(ciphertext, key)
+            return _strip_integrity_prefix(plaintext).decode("utf-8"), None
+        except Exception as exc:
+            last_error = exc
+            continue
+    if last_error is not None:
+        logger.debug("v12 decryption failed with every candidate portal key: %s", last_error)
+    reason = candidates.reason or "the portal secret did not match this cookie"
+    return None, f"v12 (SecretPortal) cookie could not be decrypted: {reason}"
+
+
 def _decrypt_chromium_value(
     encrypted_value: bytes,
     keys_v11: list[bytes],
+    v12_keys: Callable[[], _PortalKeySet] | None = None,
 ) -> tuple[str | None, str | None]:
     """Decrypt a Chromium ``encrypted_value`` blob.
 
@@ -323,6 +645,8 @@ def _decrypt_chromium_value(
         keys_v11: Candidate AES keys derived from the keyring passwords. Each is
             tried in turn, so the caller does not have to know which secret the
             desktop actually stores.
+        v12_keys: Lazy source of ``v12`` keys. It is only called for a ``v12``
+            blob, so the keyring round trip is never paid for the other schemes.
 
     Returns:
         A ``(value, warning)`` tuple. ``value`` is ``None`` when decryption
@@ -354,10 +678,7 @@ def _decrypt_chromium_value(
         msg = f"v11 decryption failed: {last_error}" if last_error else "v11 decryption failed"
         return None, msg
     if prefix == b"v12":
-        return (
-            None,
-            "v12 (Flatpak SecretPortal) cookies cannot be decrypted by third-party tools",
-        )
+        return _decrypt_v12_cookie(ciphertext, v12_keys)
     return None, f"unsupported encrypted_value prefix {prefix!r}"
 
 
@@ -446,16 +767,26 @@ def _chrome_expires_to_unix(expires_utc: int) -> int:
 
 
 def _copy_to_temp(original: Path) -> Path:
-    """Copy ``original`` to a temporary file and return the path."""
+    """Copy ``original`` to a private temporary file and return the path.
+
+    ``tempfile.mkstemp`` creates the file ``0600`` regardless of the umask, and
+    ``copyfile`` (unlike ``copy2``) does not copy the source database's mode
+    over it: the temporary copy holds live, decryptable session cookies too, so
+    it must not inherit a world-readable mode from the browser's file.
+    """
     fd, tmp_name = tempfile.mkstemp(suffix=original.suffix or ".db")
     os.close(fd)
     tmp_path = Path(tmp_name)
-    shutil.copy2(original, tmp_path)
+    shutil.copyfile(original, tmp_path)
     return tmp_path
 
 
 def _load_chromium_cookies(cookie_db: Path, keys_v11: list[bytes]) -> tuple[list[_Cookie], list[str]]:
     """Load and decrypt cookies from a Chromium ``Cookies`` SQLite database.
+
+    The ``v12`` key is looked up lazily: the closure below is only called when a
+    row actually carries the ``v12`` prefix, so a database with no ``v12``
+    cookies never pays for the D-Bus round trip to the secret service.
 
     Args:
         cookie_db: Path to the browser's ``Cookies`` database.
@@ -470,7 +801,9 @@ def _load_chromium_cookies(cookie_db: Path, keys_v11: list[bytes]) -> tuple[list
     warnings: list[str] = []
     v11_failures = 0
     v12_failures = 0
+    v12_warning: str | None = None
     other_failures: dict[str, int] = {}
+    v12_keys: Callable[[], _PortalKeySet] = partial(_PORTAL_KEY_CACHE.keys_for, _flatpak_app_id(cookie_db))
     try:
         with sqlite3.connect(f"file:{tmp_path}?mode=ro", uri=True) as conn:
             conn.row_factory = sqlite3.Row
@@ -482,12 +815,13 @@ def _load_chromium_cookies(cookie_db: Path, keys_v11: list[bytes]) -> tuple[list
             for row in rows:
                 value = row["value"]
                 if not value:
-                    decrypted, warn = _decrypt_chromium_value(row["encrypted_value"], keys_v11)
+                    decrypted, warn = _decrypt_chromium_value(row["encrypted_value"], keys_v11, v12_keys)
                     if warn:
                         if warn.startswith("v11"):
                             v11_failures += 1
                         elif warn.startswith("v12") or "SecretPortal" in warn:
                             v12_failures += 1
+                            v12_warning = warn
                         else:
                             other_failures[warn] = other_failures.get(warn, 0) + 1
                         continue
@@ -511,8 +845,11 @@ def _load_chromium_cookies(cookie_db: Path, keys_v11: list[bytes]) -> tuple[list
             f"{v11_failures} v11 cookie(s) could not be decrypted (keyring secret may be unavailable)"
         )
     if v12_failures:
+        detail = v12_warning or "v12 (SecretPortal) cookie could not be decrypted"
         warnings.append(
-            f"{v12_failures} v12 (Flatpak SecretPortal) cookie(s) cannot be decrypted by third-party tools"
+            f"{v12_failures} cookie(s) could not be decrypted: {detail}. "
+            "Launch the browser with the --password-store=basic command-line switch so it "
+            "writes v10 cookies instead; deleting the profile is not needed."
         )
     for msg, count in other_failures.items():
         warnings.append(f"{count} cookie(s) could not be decrypted: {msg}")
@@ -552,7 +889,13 @@ def _load_firefox_cookies(cookie_db: Path) -> tuple[list[_Cookie], list[str]]:
 
 
 def _load_netscape_cookies(path: Path) -> tuple[list[_Cookie], list[str]]:
-    """Load cookies from a Netscape ``cookies.txt`` file."""
+    """Load cookies from a Netscape ``cookies.txt`` file.
+
+    Only leading whitespace is stripped. A trailing tab is the separator before
+    a cookie's value, so stripping it would turn an empty value into a
+    six-field line and make the whole cache unreadable. The split is limited to
+    seven fields so a value that itself contains a tab survives intact.
+    """
     cookies: list[_Cookie] = []
     warnings: list[str] = []
     try:
@@ -561,18 +904,18 @@ def _load_netscape_cookies(path: Path) -> tuple[list[_Cookie], list[str]]:
         warnings.append(f"could not read cookie file {path}: {exc}")
         return cookies, warnings
     for line_no, raw in enumerate(text.splitlines(), start=1):
-        line = raw.strip()
+        line = raw.lstrip()
         if not line or (line.startswith("#") and not line.startswith("#HttpOnly_")):
             continue
         is_httponly = False
         if line.startswith("#HttpOnly_"):
             is_httponly = True
             line = line[len("#HttpOnly_") :]
-        parts = line.split("\t")
+        parts = line.split("\t", 6)
         if len(parts) < 7:
             warnings.append(f"{path}:{line_no}: malformed line")
             continue
-        domain, _flag, path_str, secure, expiration, name, value = parts[:7]
+        domain, _flag, path_str, secure, expiration, name, value = parts
         try:
             expires_utc = int(expiration)
         except ValueError:
@@ -592,6 +935,145 @@ def _load_netscape_cookies(path: Path) -> tuple[list[_Cookie], list[str]]:
     return cookies, warnings
 
 
+def _serialise_netscape(cookies: Sequence[_Cookie]) -> str:
+    """Serialise cookies into the Netscape ``cookies.txt`` format.
+
+    This is the single serialiser for both :meth:`CookieStore.export` and the
+    extraction cache: one artefact, one format.
+
+    Args:
+        cookies: The cookies to write.
+
+    Returns:
+        The file content, terminated by a newline.
+    """
+    lines = ["# Netscape HTTP Cookie File"]
+    for cookie in sorted(cookies, key=lambda c: (c.host_key, c.path, c.name)):
+        domain = cookie.host_key
+        flag = "TRUE" if domain.startswith(".") else "FALSE"
+        secure = "TRUE" if cookie.is_secure else "FALSE"
+        prefix = "#HttpOnly_" if cookie.is_httponly else ""
+        lines.append(
+            f"{prefix}{domain}\t{flag}\t{cookie.path}\t{secure}\t{cookie.expires_utc}"
+            f"\t{cookie.name}\t{cookie.value}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _prepare_store_dir(path: Path) -> None:
+    """Create the cookie store directory with owner-only permissions.
+
+    The directory belongs to this subsystem and will hold live session
+    cookies, so an existing one is **tightened** to ``0700`` rather than left
+    broad or refused: tightening is not destructive (the owner keeps
+    read/write/execute) and refusing would break every installation whose
+    cache directory was created with the previous, looser behaviour.
+
+    Args:
+        path: Directory to create or tighten.
+
+    Raises:
+        CookieError: When ``path`` exists but is not a directory, cannot be
+            created, or its mode cannot be changed.
+    """
+    try:
+        if path.exists() and not path.is_dir():
+            raise CookieError(f"cookie store path is not a directory: {path}")
+        path.mkdir(parents=True, exist_ok=True, mode=_STORE_DIR_MODE)
+        path.chmod(_STORE_DIR_MODE)
+    except OSError as exc:
+        raise CookieError(f"could not prepare cookie store directory {path}: {exc}") from exc
+
+
+def _prepare_output_dir(path: Path) -> None:
+    """Create a user-supplied output directory without changing an existing one.
+
+    An explicit ``--output`` path may point at ``/tmp`` or at the user's home.
+    Chmod-ing those to ``0700`` would break the desktop, so only a directory
+    this call actually creates is made private. An existing, broader directory
+    is kept as-is with a warning; the file written into it is still ``0600``.
+
+    Args:
+        path: Parent directory of an explicitly requested export path.
+
+    Raises:
+        CookieError: When ``path`` exists but is not a directory or cannot be
+            created.
+    """
+    try:
+        if path.exists():
+            if not path.is_dir():
+                raise CookieError(f"cookie output path is not a directory: {path}")
+            if path.stat().st_mode & 0o077:
+                logger.warning(
+                    "cookie output directory %s is accessible to group/others; "
+                    "the exported file itself is still 0600",
+                    path,
+                )
+            return
+        path.mkdir(parents=True, exist_ok=True, mode=_STORE_DIR_MODE)
+    except OSError as exc:
+        raise CookieError(f"could not prepare cookie output directory {path}: {exc}") from exc
+
+
+def _write_private_file(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` atomically with mode ``0600``.
+
+    The content is written to a temporary file that is created ``0600`` by
+    ``tempfile.mkstemp`` (which ignores the umask) and then moved into place
+    with :meth:`Path.replace`. That way the destination never exists in a
+    world-readable state, not even for the duration of the write, and a crash
+    mid-write leaves no half-written cookie file behind.
+
+    Args:
+        path: Destination file.
+        text: Complete file content.
+
+    Raises:
+        OSError: When the temporary file cannot be created, written or moved.
+    """
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        os.fchmod(fd, _COOKIE_FILE_MODE)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1  # ownership of the descriptor now belongs to ``handle``
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp_path.replace(path)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _selection_digest(settings: CookieSettings) -> str:
+    """Return a filesystem-safe digest of the cookie selection.
+
+    The cache must never be served for a different selection: the store can
+    hold cookies from many profiles and the same browser can be narrowed with
+    ``profile`` and ``source``. Every field that changes what is extracted is
+    folded into the digest, so ``--profile A`` and ``--profile B`` cannot read
+    each other's cache.
+
+    Args:
+        settings: The cookie settings that select the source.
+
+    Returns:
+        A 16-character hexadecimal digest, safe as a filename component.
+    """
+    parts = (
+        f"v{_CACHE_FORMAT_VERSION}",
+        settings.browser.strip().lower(),
+        (settings.source or "any").strip().lower(),
+        settings.profile.strip(),
+        "flatpak" if settings.flatpak else "system-only",
+    )
+    return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
 def _match_domain(host_key: str, domain: str) -> bool:
     """Return whether ``host_key`` matches ``domain`` (handles leading dot)."""
     if host_key.startswith("."):
@@ -609,15 +1091,34 @@ class CookieStore:
     protocol.
     """
 
-    def __init__(self, settings: CookieSettings) -> None:
+    def __init__(
+        self,
+        settings: CookieSettings,
+        *,
+        use_cache: bool | None = None,
+        cache_ttl: float | None = None,
+    ) -> None:
+        """Create a store for one cookie selection.
+
+        Args:
+            settings: The cookie selection to load.
+            use_cache: Whether an existing, fresh extraction cache may be used
+                instead of reading the browser again. ``None`` takes the
+                setting's value; ``False`` forces a fresh extraction (the
+                ``cookies export`` path does this).
+            cache_ttl: Override for the cache lifetime. ``None`` takes the
+                setting's value.
+        """
         self.settings = settings
         self._cookies: list[_Cookie] = []
         self._sources: list[str] = []
         self._warnings: list[str] = []
         self._loaded = False
         self._keys_v11: list[bytes] = []
+        self._use_cache = settings.use_cache if use_cache is None else use_cache
+        self._cache_ttl = settings.cache_ttl if cache_ttl is None else cache_ttl
 
-    async def load(self) -> None:
+    async def load(self, *, use_cache: bool | None = None) -> None:
         """Resolve the configured cookie source and load all cookies.
 
         With no profile configured, **every** profile of the selected browser is
@@ -625,6 +1126,14 @@ class CookieStore:
         profile while the other cookies are scattered across the rest, and
         merging beats guessing. On a conflict the value from the profile with
         the stronger session wins.
+
+        A cache written for the same selection by an earlier run is used when it
+        is fresh, unexpired and readable; otherwise the browser is read again and
+        the cache is rewritten.
+
+        Args:
+            use_cache: Overrides the store's ``use_cache`` setting for this call.
+                ``False`` forces a fresh extraction; ``None`` keeps the setting.
         """
         self._cookies = []
         self._sources = []
@@ -644,6 +1153,13 @@ class CookieStore:
             self._warnings.append("browser cookie extraction disabled (no browser configured)")
             return
 
+        cache_enabled = self._use_cache if use_cache is None else use_cache
+        if cache_enabled:
+            cached = await asyncio.to_thread(self._read_cache)
+            if cached is not None:
+                self._cookies = cached
+                return
+
         profiles = discover_browsers(
             include_flatpak=self.settings.flatpak,
             browsers=[self.settings.browser],
@@ -657,9 +1173,92 @@ class CookieStore:
             selected = self._match_profile(profiles)
             if selected is not None:
                 await self._load_profile(selected)
+                await asyncio.to_thread(self._write_cache)
             return
 
         await self._load_all_profiles(profiles)
+        await asyncio.to_thread(self._write_cache)
+
+    def _cache_path(self) -> Path:
+        """Return the cache file path for this store's selection.
+
+        Returns:
+            ``<store_dir>/cache-<browser>-<digest>.txt``. The digest covers the
+            browser, source, profile and Flatpak setting, so two selections never
+            share a file.
+        """
+        store_dir = Path(self.settings.store_dir).expanduser()
+        digest = _selection_digest(self.settings)
+        return store_dir / f"cache-{self.settings.browser or 'cookies'}-{digest}.txt"
+
+    def _read_cache(self) -> list[_Cookie] | None:
+        """Load the selection's cached cookies when they are usable.
+
+        The cache is rejected, and the caller falls back to extraction, when it
+        is missing, older than the TTL, unreadable, malformed, empty or holds
+        nothing but expired cookies. Expired cookies are dropped rather than
+        served: the Netscape expiry is authoritative once a cache exists.
+
+        Returns:
+            The usable cookies, or ``None`` when the cache must not be used.
+        """
+        path = self._cache_path()
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            message = f"could not inspect cookie cache {path}: {exc}"
+            logger.warning(message)
+            self._warnings.append(message)
+            return None
+
+        age = time.time() - stat.st_mtime
+        if age > self._cache_ttl:
+            logger.info(
+                "cookie cache %s is %.0fs old (ttl %.0fs); extracting again",
+                path,
+                age,
+                self._cache_ttl,
+            )
+            return None
+
+        cookies, warnings = _load_netscape_cookies(path)
+        if warnings:
+            message = f"ignoring corrupt cookie cache {path}: {'; '.join(warnings)}"
+            logger.warning(message)
+            self._warnings.append(message)
+            return None
+
+        now = time.time()
+        unexpired = [c for c in cookies if c.expires_utc == 0 or c.expires_utc > now]
+        dropped = len(cookies) - len(unexpired)
+        if dropped:
+            logger.info("dropped %d expired cookie(s) from cache %s", dropped, path)
+        if not unexpired:
+            logger.info("cookie cache %s holds no usable cookies; extracting again", path)
+            return None
+
+        logger.info("reusing %d cookie(s) from cache %s", len(unexpired), path)
+        self._sources.append(f"cache: {path}")
+        return unexpired
+
+    def _write_cache(self) -> None:
+        """Write the extracted cookies to the selection's cache file.
+
+        The cache is an optimisation, so a failure to write it is recorded as a
+        warning rather than raised: the extraction itself succeeded.
+        """
+        if not self._cookies:
+            return
+        path = self._cache_path()
+        try:
+            _prepare_store_dir(path.parent)
+            _write_private_file(path, _serialise_netscape(self._cookies))
+        except (OSError, CookieError) as exc:
+            message = f"could not write cookie cache {path}: {exc}"
+            logger.warning(message)
+            self._warnings.append(message)
 
     def _filter_by_source(self, profiles: list[BrowserProfile]) -> list[BrowserProfile]:
         """Drop the profiles that do not belong to the configured source.
@@ -771,22 +1370,27 @@ class CookieStore:
     async def _probe_profile(self, profile: BrowserProfile) -> list[_Cookie] | None:
         """Read a profile's cookies and record a report for it.
 
+        Warnings from the extraction are added to the store, so a profile loaded
+        as part of a merge still reports cookies that could not be decrypted.
+
         Args:
             profile: The profile to inspect.
 
         Returns:
             The decrypted cookies, or ``None`` when the profile cannot be read.
         """
+        warnings: list[str] = []
         try:
             if profile.browser == "firefox":
-                cookies, _ = await asyncio.to_thread(_load_firefox_cookies, profile.cookie_db)
+                cookies, warnings = await asyncio.to_thread(_load_firefox_cookies, profile.cookie_db)
             else:
                 passwords = await asyncio.to_thread(_get_secret_tool_passwords, profile.product)
                 keys = [_derive_key(password) for password in passwords]
-                cookies, _ = await asyncio.to_thread(_load_chromium_cookies, profile.cookie_db, keys)
+                cookies, warnings = await asyncio.to_thread(_load_chromium_cookies, profile.cookie_db, keys)
         except OSError as exc:
             logger.warning("could not read cookies in %s: %s", profile.cookie_db, exc)
             return None
+        self._warnings.extend(warnings)
         names = {c.name for c in cookies}
         session_domains = tuple(
             domain for domain in self._session_domains() if names & _SESSION_COOKIES[domain]
@@ -842,6 +1446,11 @@ class CookieStore:
     def export(self, path: Path | None = None) -> dict[str, Any]:
         """Write a Netscape ``cookies.txt`` and return a report.
 
+        The export always reflects a fresh extraction when the store has not
+        been loaded yet: a cached extraction is bypassed so ``cookies export``
+        cannot hand back a session the browser has already replaced. The file is
+        written atomically with mode ``0600``.
+
         Args:
             path: Destination path. Defaults to
                 ``<store_dir>/<browser>.txt``.
@@ -854,27 +1463,19 @@ class CookieStore:
             try:
                 asyncio.get_running_loop()
             except RuntimeError:
-                asyncio.run(self.load())
+                asyncio.run(self.load(use_cache=False))
             else:
                 raise CookieError("cookie store not loaded; await load() before export")
 
         if path is None:
             store_dir = Path(self.settings.store_dir).expanduser()
-            store_dir.mkdir(parents=True, exist_ok=True)
+            _prepare_store_dir(store_dir)
             path = store_dir / f"{self.settings.browser or 'cookies'}.txt"
         else:
             path = Path(path)
-            path.parent.mkdir(parents=True, exist_ok=True)
+            _prepare_output_dir(path.parent)
 
-        lines = ["# Netscape HTTP Cookie File"]
-        for c in sorted(self._cookies, key=lambda x: (x.host_key, x.path, x.name)):
-            domain = c.host_key
-            flag = "TRUE" if domain.startswith(".") else "FALSE"
-            secure = "TRUE" if c.is_secure else "FALSE"
-            expiration = str(c.expires_utc)
-            prefix = "#HttpOnly_" if c.is_httponly else ""
-            lines.append(f"{prefix}{domain}\t{flag}\t{c.path}\t{secure}\t{expiration}\t{c.name}\t{c.value}")
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        _write_private_file(path, _serialise_netscape(self._cookies))
 
         domains_report: dict[str, int] = {}
         for domain in self.settings.domains:

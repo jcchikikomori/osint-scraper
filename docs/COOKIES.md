@@ -84,10 +84,11 @@ Chromium-family browsers store cookie values encrypted in the `encrypted_value` 
 | --- | --- | --- |
 | `v10` | AES-128-CBC, key = `PBKDF2-HMAC-SHA1(password="peanuts", salt="saltysalt", 1, 16)` | none — the password is fixed |
 | `v11` | AES-128-CBC, same derivation | the OS keyring secret for the browser |
-| `v12` | xdg-desktop-portal SecretPortal | not readable by third-party tools |
+| `v12` | AES-256-GCM, key = HKDF-SHA256(SecretPortal secret, salt `fdo_portal_secret_salt`, info `HKDF-SHA-256 AES-256-GCM`) | the xdg-desktop-portal secret for the Flatpak app, readable from the host keyring |
 | `v20` | App-Bound Encryption | not readable outside the browser process |
 
-All of them use an IV of sixteen space characters and PKCS#7 padding. Two details matter:
+`v10` and `v11` use an IV of sixteen space characters and PKCS#7 padding; `v12` uses a random
+12-byte nonce and a 16-byte GCM tag. Two details matter:
 
 1. **The plaintext carries a 32-byte integrity prefix** (a keyed digest of the cookie) that has
    to be stripped before the value. Skipping this step yields plausible-looking garbage.
@@ -123,22 +124,44 @@ If `secret-tool` is missing, install it — on Arch that is `libsecret-tools`, o
 `libsecret-tools`, on Fedora `libsecret`. A missing `secret-tool` produces a misleading
 "system keyring unavailable" error even when the keyring itself is running fine.
 
-## The `v12` problem
+## `v12` cookies
 
-Flatpak-packaged Chromium browsers cannot reach the host keyring directly, so they go through the
-xd-desktop-portal SecretPortal, which stores the cookie key under the `v12` scheme. **No
-third-party tool can decrypt `v12` cookies** — `browser_cookie3`, `gallery-dl`, `yt-dlp`,
-`pycookiecheat` and `rookie` all fail on them.
+`v12` is Chromium's `os_crypt_async` **SecretPortalKeyProvider** scheme. New data is only encrypted
+with it when the `SecretPortalKeyProviderUseForEncryption` feature is enabled, which is disabled by
+default in Chromium 156, 158, 159 and main: a normal Flatpak Chrome or Edge writes `v10`, and Brave
+writes `v10`/`v11`. It is therefore rare today, but it is reachable and not Flatpak-exclusive in
+principle.
 
-When this tool detects `v12` cookies it says so explicitly instead of silently returning
-nothing. The fix is on the browser side: start the Flatpak browser with `--password-store=basic`
-so it writes `v10` cookies, which are decryptable by everyone:
+The scheme is HKDF-SHA256 (salt `fdo_portal_secret_salt`, info `HKDF-SHA-256 AES-256-GCM`) to a
+32-byte key, then AES-256-GCM with a random 12-byte nonce prepended and a 16-byte tag appended. The
+plaintext carries the same 32-byte integrity prefix as `v10`/`v11`.
+
+The key is the portal secret, one per sandboxed app. On KDE the portal stores it in KWallet under
+the `xdg-desktop-portal` server attribute, with the Flatpak app ID as the `user` attribute; GNOME
+Keyring and other backends expose the same attributes through `org.freedesktop.secrets`. Any user
+process can read it. `secret-tool` cannot, because the secret is binary, which is why this tool
+reads it through the optional `secretstorage` package:
 
 ```bash
-flatpak run --command=google-chrome com.google.Chrome --password-store=basic
+pip install "osint-scraper[cookies]"
 ```
 
-Log in to the site while it is running in that mode, then export the cookies again.
+`v12` support is lazy and optional: the keyring is only queried when a `v12` cookie is actually
+encountered, the result is cached for the run, and every candidate secret is tried. When
+`secretstorage` is missing, the keyring is locked, or no portal secret exists for the app, the
+cookie is reported in the warnings and the rest of the profile still loads.
+
+If the portal secret cannot be read, the browser-side workaround is to launch the browser with
+`--password-store=basic` as a command-line switch so it writes `v10` instead:
+
+```bash
+flatpak run --command=chrome com.google.Chrome --password-store=basic
+```
+
+There is no `#password-store-basic` option in `chrome://flags` or `brave://flags`, and
+`flatpak override --env=CHROME_PASSWORD_STORE=basic` cannot work because the switch is argv-only.
+Existing `v12` values stay `v12` after the switch, so log in again while it is running in that mode.
+**Deleting the profile is not necessary.**
 
 ### A note on `browser_cookie3`
 

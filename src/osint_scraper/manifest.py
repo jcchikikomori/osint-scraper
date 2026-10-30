@@ -1,7 +1,13 @@
 """Manifest writing.
 
-Every run produces a ``manifest.jsonl`` next to the downloaded media: one JSON
-object per downloaded file plus one object per crawled post that had no media.
+Every run produces a ``manifest.jsonl`` next to the downloaded media. Each line
+is one of three kinds of record:
+
+* ``"post"`` — one per crawled post, whether or not it carried media.
+* ``"media"`` — one per media object discovered on a post, recording the
+  object's identity and position before any download happens.
+* ``"file"`` — one per downloaded file, carrying the path, digest and size.
+
 The manifest is the audit trail of a collection run — it records what was found,
 where it came from and when.
 """
@@ -14,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from osint_scraper.models import Post
+from osint_scraper.models import MediaRef, Post
 
 
 @dataclass(slots=True)
@@ -22,7 +28,8 @@ class ManifestEntry:
     """A single line of the manifest.
 
     Attributes:
-        kind: ``"post"`` for a crawled post, ``"file"`` for a downloaded file.
+        kind: ``"post"`` for a crawled post, ``"media"`` for a media object
+            discovered on a post, or ``"file"`` for a downloaded file.
         platform: Platform the entry came from.
         target: Target handle the entry came from.
         post_id: Post identifier, when applicable.
@@ -120,6 +127,39 @@ class ManifestWriter:
                     "quoted_post_id": post.quoted_post_id,
                     "parent_post_id": post.parent_post_id,
                     **post.metadata,
+                },
+            )
+        )
+        for ref in post.media:
+            self.write_media(post, ref)
+
+    def write_media(self, post: Post, ref: MediaRef) -> None:
+        """Append an entry describing one media object attached to ``post``.
+
+        The row records discovery only: the ``"file"`` row written after a
+        download carries the path, digest and size.
+
+        Args:
+            post: The post that owns the media object.
+            ref: The media reference to record.
+        """
+        self.write(
+            ManifestEntry(
+                kind="media",
+                platform=post.platform,
+                target=post.target,
+                post_id=post.post_id,
+                url=ref.url,
+                timestamp=post.timestamp,
+                metadata={
+                    "index": ref.index,
+                    "media_id": ref.media_id,
+                    "kind": ref.kind,
+                    "width": ref.width,
+                    "height": ref.height,
+                    "mime": ref.mime,
+                    "extension": ref.extension,
+                    "shortcode": post.shortcode,
                 },
             )
         )

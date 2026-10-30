@@ -9,8 +9,9 @@ manifest_name: manifest.jsonl
 crawl:
   # Maximum posts per target. 0 means unlimited.
   limit: 0
-  # Keep posts that carry no media (text-only posts) in the manifest.
-  include_text_only: false
+  # Keep posts that carry no media (text-only posts) in the manifest.  A post
+  # with no media is only a caption; turn this off to collect media and not prose.
+  include_text_only: true
   platforms:
     - instagram
     - threads
@@ -62,10 +63,18 @@ cookies:
     - facebook.com
   # Use an existing Netscape cookies.txt instead of extracting from a browser.
   file: ""
+  # Chromium v12 (SecretPortal) cookies are decrypted from the host keyring when
+  # the optional secretstorage package is installed:
+  #   pip install "osint-scraper[cookies]"
+  # Without it, v12 cookies are reported in the warnings instead of dropped silently.
   # Where exported cookie files are written.
   store_dir: ~/.cache/osint-scraper/cookies
 
 ratelimit:
+  # Whether cooldowns are enforced at all.  Turning this off ignores a
+  # throttle, which is what turns a rate limit into a permanent spam flag --
+  # leave it on unless you are deliberately testing the throttle itself.
+  enabled: true
   # How long a host is left alone after it throttles us. The cooldown is persisted,
   # so it also applies to the next run -- retrying through a throttle is what turns
   # a rate limit into a spam flag.

@@ -26,6 +26,11 @@ class MediaRef:
         height: Pixel height when known, otherwise ``None``.
         mime: MIME type when the platform advertises one.
         extension: File extension including the dot, when known (e.g. ``".mp4"``).
+        index: Zero-based position of this media object within the owning
+            post's media list, when known.
+        media_id: The platform's own identifier for this media object, when it
+            has one (for example an Instagram media id or a Threads child
+            ``pk``).
     """
 
     url: str
@@ -34,6 +39,8 @@ class MediaRef:
     height: int | None = None
     mime: str | None = None
     extension: str | None = None
+    index: int | None = None
+    media_id: str | None = None
 
     @property
     def size(self) -> int | None:
@@ -41,6 +48,21 @@ class MediaRef:
         if self.width and self.height:
             return self.width * self.height
         return None
+
+
+def stamp_indices(refs: list[MediaRef]) -> list[MediaRef]:
+    """Return refs with their position in the list recorded on each.
+
+    ``MediaRef`` is frozen, so the index cannot be set in place. The returned
+    list is new; the input list is left untouched.
+
+    Args:
+        refs: Media references in the order the owning post presents them.
+
+    Returns:
+        A new list where each reference carries its zero-based ``index``.
+    """
+    return [dataclasses.replace(ref, index=position) for position, ref in enumerate(refs)]
 
 
 @dataclass(slots=True)
@@ -55,7 +77,9 @@ class Post:
         permalink: Canonical public URL of the post.
         caption: Post text/caption, when present.
         timestamp: Unix timestamp of publication, when known.
-        media: Media objects attached to the post. Empty for text-only posts.
+        media: Media objects attached to the post, each stamped with its
+            position and platform media id when known. Empty for text-only
+            posts.
         metadata: Platform-specific extras (engagement counts, quoted post ids, ...).
         quoted_post_id: Id of a quoted post, when the post quotes another.
         parent_post_id: Id of the post being replied to, when the post is a reply.

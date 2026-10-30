@@ -41,9 +41,26 @@ Last updated: 2026-10-30
       `Instaloader.load_session()`, so private profiles, stories and highlights are reachable
 - [x] Profile selection prefers a profile holding a live session over one with more anonymous cookies
 - [x] Unit tests with a fake instaloader (no network)
-- [ ] Secondary engine: gallery-dl (currently broken upstream — see risk R3)
-- [ ] Stories / highlights / IGTV / tagged posts (need an authenticated session)
-- [ ] Carousel children as first-class manifest rows
+- [x] **Carousel children as first-class manifest rows** — each media object attached to a post
+      now gets its own `"media"` row in the manifest, carrying its position, its kind, its
+      dimensions and the platform's own id for it. A carousel used to be indistinguishable from
+      three unrelated posts: every child shared the parent's `post_id` and its only identity was
+      a `_1` / `_2` / `_3` filename suffix.
+- [x] **Stories / highlights / tagged posts** — selected by the target URL, the way `yt-dlp`
+      selects by URL: `instagram.com/<user>/tagged/`, `instagram.com/stories/<user>/`,
+      `instagram.com/<user>/highlights/`. All three verified live: the active story reel, **135
+      highlight items across 5 highlights**, and the posts a target is tagged in. They are reached
+      through the iPhone API, which needs the authenticated session.
+- [!] **IGTV is broken upstream.** `profile.get_igtv_posts()` raises `KeyError: 'edges'` — the
+      GraphQL response shape changed. The crawler reports it as a domain error naming the cause
+      rather than letting a raw `KeyError` escape. IGTV videos also appear in the profile feed.
+- [ ] Secondary engine: gallery-dl (currently broken — see risk R3). **Verified 2026-10-30:**
+      gallery-dl 1.32.18's Instagram extractor mines its `doc_id` at run time from the JS bundles,
+      but the page it fetches carries **no bundle references at all** — it requests the profile
+      with `Sec-Fetch-Site: none` / `Sec-Fetch-Mode: navigate`, and Instagram answers that with a
+      778 KB page containing zero `.js` URLs. The same URL fetched with a plain user agent
+      returns 512 KB carrying six bundles, and the query id mines out of them. The technique is
+      sound; gallery-dl's page fetch is what is broken.
 
 ### M2 — Threads (phase one)
 
@@ -56,13 +73,15 @@ Last updated: 2026-10-30
 - [x] `profile()` from the same payload
 - [x] `ParseError` with diagnostics when the envelope changes
 - [x] Unit tests with an inline HTML fixture (no network)
-- [!] Full history is **not** reachable unauthenticated — Meta's SSR ceiling is roughly the 10–20
-      most recent posts per profile. **Resolved by the GraphQL transport (see M2).** The
-      server-rendered page is still the fallback.
+- [x] Full history is reachable over the **GraphQL transport**. Meta's server-rendered ceiling is
+      roughly the 10–20 most recent posts per profile, but the GraphQL transport walks the whole
+      timeline — **215 posts for `@somehandle` (2023-08-03 → 2026-10-13)** against 10 through the
+      page. The server-rendered page is kept as the fallback.
 - [!] **A private Threads profile yields no posts at all.** Threads does not server-render private
       profiles, so the page carries the user object (`text_post_app_is_private: true`) but no posts.
-      The crawler detects this and says so instead of blaming the user agent. Reading a private
-      Threads profile needs the GraphQL transport.
+      The crawler detects this and says so instead of blaming the user agent. The GraphQL transport
+      does **not** help: it answers `1675030` for a private profile (risk R12), so private Threads
+      profiles stay unreachable.
 - [x] Threads authentication: the session cookie lives on `.threads.com` while the site is served
       from `threads.net`, so both domains are merged into one `Cookie` header
 - [x] Empty-payload retries that rotate the user agent, for the intermittently served shell
@@ -104,9 +123,22 @@ Last updated: 2026-10-30
       bare name is refused rather than guessed
 - [x] `osint-scraper cookies list` reports each profile's cookie count and session domains
 - [x] Persistent cooldown state: a throttle stops the next run, not just the current one
-- [ ] Resolve the `v12` case instead of only reporting it — see risk R4
-- [ ] Rotate/store exported cookie files with restrictive permissions
-- [ ] Cookie file reuse from the store dir (currently re-extracts on every run)
+- [x] **The `v12` case is resolved, not merely reported.** The old advice was wrong on two
+      counts: `v12` is not Flatpak-exclusive in principle, and the `chrome://flags`
+      `#password-store-basic` option does not exist. `v12` is Chromium's `os_crypt_async`
+      SecretPortal scheme — HKDF-SHA256 into **AES-256-GCM** — and the portal secret is
+      persisted in the host keyring, where a Secret Service client can read it. The detection
+      path stays as the fallback when the secret cannot be found.
+- [x] **Exported cookie files and the extraction cache carry restrictive permissions** — `0600`
+      for the files, `0700` for the store directory, applied at creation rather than afterwards
+      so the file is never world-readable even mid-write. The temporary copy of the browser's
+      cookie database was leaking `0644` too, and no longer does.
+- [ ] Rotate the exported cookie file — an export is overwritten in place today, but nothing
+      forces a fresh one to replace an old export on disk.
+- [x] **Cookie file reuse from the store dir** — the extraction is cached per selection, so a
+      second run does not re-read and re-decrypt the browser's cookie database. The cache is
+      keyed on the browser, the profile and the source, expires after `cookies.cache_ttl`, and
+      never serves an expired cookie.
 
 ### M4 — Search engines (phase three)
 
@@ -138,7 +170,28 @@ Last updated: 2026-10-30
 - [x] `osint-scraper history` to inspect the history and prune the entries whose file is gone
 - [ ] HTML/CSV report per target (post table with engagement metrics)
 - [ ] EXIF extraction and embedding (`piexif` or `Pillow`)
-- [ ] Content-hash dedupe across platforms (the same image reposted on IG and Threads)
+- [x] **Content-hash dedupe across platforms** — the `hashes` index is keyed on the SHA-256 alone,
+      so the same image reposted on Instagram and Threads is stored once and the second copy is
+      discarded in favour of the existing file
+- [x] **Wired up the four config settings that were read by nobody** — each was declared in
+      `config/default.yaml` and the settings dataclass but never consulted, so setting it was
+      silently ignored:
+      - `crawl.max_posts_per_target` — the "hard ceiling … so a runaway target cannot fill the
+        disk" did not exist. It is now applied per target and the tighter of it and `crawl.limit`
+        wins, with a warning when it bites.
+      - `ratelimit.cooldown_minutes` — `ratelimit.py` applied its own constant. The setting now
+        decides how long a throttled host is left alone.
+      - `ratelimit.enabled` — cooldowns were always enforced. The switch now works: a throttle is
+        logged but no cooldown is started, and an existing one is ignored.
+      - `crawl.include_text_only` — text-only posts were always written to the manifest. The
+        switch now decides, and defaults to keeping them so no existing run loses data.
+- [x] **The default cooldown was 60 seconds, not 60 minutes.** `DEFAULT_COOLDOWN_MINUTES` was
+      used as a seconds count, so a throttle paused the tool for one minute — sixty times shorter
+      than the name claimed, and far too short for an account-level throttle (R11).
+- [x] **A timeline cut short by the page ceiling now says so.** The GraphQL paging loop ran out
+      of pages silently and the result was reported as a complete timeline. Every post now
+      carries `truncated` and a `truncation_reason`, so a short history cannot be mistaken for
+      a whole one.
 - [ ] Packaging: AUR / Flatpak manifest / `pipx` entry point
 - [ ] CI: `ruff`, `mypy --strict`, `pytest` on every push
 
@@ -161,8 +214,8 @@ are pinned; upgrade deliberately and keep a last-known-good version.
 | --- | --- | --- | --- | --- |
 | R1 | Instagram breaks its private GraphQL | instaloader stops returning posts | Pin version; keep gallery-dl as an independent second extractor; pin a last-known-good | Open |
 | R2 | Threads `doc_id` values rotate | GraphQL transport returns nothing | **Mitigated**: the query id and its variables are mined from the server-rendered page at run time, never hardcoded; the SSR page stays the fallback | Open |
-| R3 | gallery-dl Instagram extractor failing today | Secondary engine unavailable | Primary is instaloader; track upstream; add gallery-dl back when it recovers | **Active** |
-| R4 | Flatpak Chromium cookies are `v12` (SecretPortal) | Cookies unreadable for Flatpak-only users | Detect and report; suggest `--password-store=basic` so the browser writes decryptable `v10` | Open |
+| R3 | gallery-dl Instagram extractor failing today | Secondary engine unavailable | **Root cause found 2026-10-30**: gallery-dl mines its `doc_id` at run time, but fetches the profile with `Sec-Fetch-*` headers, and Instagram answers *that* request with a page carrying no JS bundles — so the mining finds nothing and the query id lookup raises `KeyError`. The same page fetched with a plain user agent carries six bundles and mines cleanly. Primary is instaloader; the mining technique is proven and can be implemented in-house | **Active** |
+| R4 | Flatpak Chromium cookies are `v12` (SecretPortal) | Cookies unreadable for Flatpak-only users | **Resolved 2026-10-30**: `v12` is decryptable — the portal secret is persisted in the host keyring and a Secret Service client can read it. Implemented, with the detection path kept as the fallback when the secret cannot be found | **Closed** |
 | R5 | Threads changes the User-Agent gate | SSR returns an empty shell | Multiple UA variants; loud `ParseError` with diagnostics; monitor the mobile UA | Open |
 | R6 | Threads SSR pagination ceiling (~10–20 posts) | Incomplete history | **Resolved** by the GraphQL transport, with the SSR page kept as the fallback | Closed |
 | R12 | The Threads GraphQL transport answers `1675030` for private profiles | Private Threads profiles stay unreadable | Nothing to do yet; the official Threads API needs app review and business verification, and only reads public profiles | Open |
@@ -199,6 +252,10 @@ are pinned; upgrade deliberately and keep a last-known-good version.
 | 2026-10-30 | The Threads GraphQL transport is **anonymous**, and the query id is mined from the page at run time | A logged-in request returns a different, non-paginating query, and the session cookie makes the endpoint answer with HTML instead of JSON. Mining the id means a bundle rotation is picked up automatically instead of breaking silently |
 | 2026-10-30 | The **server-rendered page stays the fallback** for Threads | A broken GraphQL transport should degrade the result to the recent posts, not fail the run |
 | 2026-10-30 | A target a platform does not recognise is **skipped for that platform**, not fatal | A Threads link used to die on the Instagram crawler before the Threads crawler ever saw it |
+| 2026-10-30 | The cooldown length is expressed in **minutes**, and the constant is multiplied by 60 | `DEFAULT_COOLDOWN_MINUTES` was used as a seconds count, so a throttle paused the tool for one minute instead of an hour — sixty times too short for an account-level throttle |
+| 2026-10-30 | The **cookie extraction cache** is keyed on the selection, and the store dir is `0700` | A cache written for one profile must never be served for another, or the tool would scrape with the wrong session; exported cookies are live sessions and were being written world-readable |
+| 2026-10-30 | The Instagram surfaces are selected by the **target URL**, not by a flag | It matches how `yt-dlp` selects by URL and how the Threads crawler already handles a direct post link, and it needs no new CLI surface |
+| 2026-10-30 | A carousel child's identity is read from the **parent's `carousel_media`** when it is there | instaloader's sidecar objects carry only a URL and a video flag. The parent's node carries the child's own media id, media type and dimensions — but only for anonymous reads, so an authenticated run gets what the platform gives it and no extra request is made |
 
 ## Explicitly not doing
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
@@ -27,6 +28,7 @@ from osint_scraper.config.settings import Settings, load_settings
 from osint_scraper.crawlers.base import CrawlContext, get_crawler, load_crawlers
 from osint_scraper.exceptions import OsintScraperError, UnsupportedTargetError
 from osint_scraper.logs import setup_logging
+from osint_scraper.models import Post
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from osint_scraper.ratelimit import Pacer
@@ -124,6 +126,13 @@ def scrape(
         str | None,
         typer.Option("--source", help="Restrict to one installation: system, flatpak or any."),
     ] = None,
+    cookie_cache: Annotated[
+        bool,
+        typer.Option(
+            "--cookie-cache/--no-cookie-cache",
+            help="Reuse a recent cookie extraction instead of reading the browser again. On by default.",
+        ),
+    ] = True,
     download: Annotated[
         bool,
         typer.Option("--download/--no-download", help="Download the discovered media."),
@@ -170,6 +179,7 @@ def scrape(
         settings.cookies.profile = profile
     if source is not None:
         settings.cookies.source = source
+    settings.cookies.use_cache = cookie_cache
     if output is not None:
         settings.download.directory = str(output)
     if limit is not None:
@@ -202,6 +212,48 @@ def scrape(
         raise typer.Exit(code=1) from exc
 
     typer.echo(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+def _keep_post(post: Post, include_text_only: bool) -> bool:
+    """Return whether a crawled post should be recorded.
+
+    A post that carries no media is only a caption.  Keeping those is useful
+    for a text-first account and pure noise for a media-first one, so it is a
+    setting rather than a fixed rule.
+
+    Args:
+        post: The crawled post.
+        include_text_only: Whether posts without media are kept.
+
+    Returns:
+        Whether the post should be recorded.
+    """
+    return post.has_media or include_text_only
+
+
+def _effective_post_limit(settings: Settings, logger: logging.Logger) -> int | None:
+    """Return the per-target post ceiling for a run.
+
+    ``crawl.limit`` is the user's own cap and ``crawl.max_posts_per_target`` is
+    the safety ceiling that stops a runaway target from filling the disk. The
+    tighter of the two wins.
+
+    Args:
+        settings: The resolved settings.
+        logger: Logger for the warning.
+
+    Returns:
+        The ceiling, or ``None`` when neither limit applies.
+    """
+    limit = settings.crawl.limit or None
+    cap = settings.crawl.max_posts_per_target
+    if cap and cap > 0 and (limit is None or limit > cap):
+        logger.warning(
+            "crawl.max_posts_per_target caps this run at %d post(s) per target",
+            cap,
+        )
+        return cap
+    return limit
 
 
 def _enforce_cooldowns(pacer: Pacer, platforms: list[str]) -> None:
@@ -300,7 +352,13 @@ async def _run_scrape(
     logger = setup_logging(settings.log_level)
 
     store = CooldownStore.load(settings.ratelimit.file)
-    pacer = Pacer(store, base_delay=settings.download.delay, jitter=settings.download.jitter)
+    pacer = Pacer(
+        store,
+        base_delay=settings.download.delay,
+        jitter=settings.download.jitter,
+        cooldown_minutes=settings.ratelimit.cooldown_minutes,
+        enabled=settings.ratelimit.enabled,
+    )
 
     cookie_store = CookieStore(settings.cookies)
     if use_cookies:
@@ -336,6 +394,7 @@ async def _run_scrape(
         )
         manifest_writer = ManifestWriter(root / settings.manifest_name) if write_manifest else None
         summary: dict[str, Any] = {"output": str(root), "targets": [], "skipped": []}
+        post_limit = _effective_post_limit(settings, logger)
         try:
             for plat in platforms:
                 crawler_cls = get_crawler(plat)
@@ -353,7 +412,9 @@ async def _run_scrape(
                     found = 0
                     downloaded = 0
                     try:
-                        async for post in crawler.crawl(tgt, limit=settings.crawl.limit or None):
+                        async for post in crawler.crawl(tgt, limit=post_limit):
+                            if not _keep_post(post, settings.crawl.include_text_only):
+                                continue
                             found += 1
                             database.record_post(
                                 platform=post.platform,
@@ -439,7 +500,9 @@ def cookies_list(
         settings.cookies.source = "any"
         store = CookieStore(settings.cookies)
         try:
-            asyncio.run(store.load())
+            # A probe has to read every profile to count its cookies and
+            # detect its session, so the cache must not short-circuit it.
+            asyncio.run(store.load(use_cache=False))
         except OsintScraperError as exc:
             typer.secho(f"warning: {exc}", fg=typer.colors.YELLOW, err=True)
         else:

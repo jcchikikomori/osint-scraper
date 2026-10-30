@@ -10,7 +10,7 @@ manifest recording exactly what was collected, from where and when.
 | Platform | Engine | Auth required for public posts |
 | --- | --- | --- |
 | Instagram | `instaloader` 4.16 | No |
-| Threads | public profile SSR (mobile-app UA) | No |
+| Threads | GraphQL timeline over the web app's own endpoint | No |
 | Facebook | planned | — |
 | Search engines | planned | — |
 
@@ -144,9 +144,24 @@ Retrying now is what causes the flag -- wait it out.
 Use `osint-scraper cooldown --clear` to override deliberately.
 ```
 
-The pacing itself is adaptive: the gap between requests grows on every throttle and relaxes
-again once the host stops pushing back. The baseline is `delay` plus `jitter` from the config,
-and a fixed interval is deliberately avoided — a constant cadence is a scraping signature.
+The cooldown lasts `ratelimit.cooldown_minutes` — 60 minutes by default. The pacing itself is
+adaptive: the gap between requests grows on every throttle and relaxes again once the host stops
+pushing back. The baseline is `delay` plus `jitter` from the config, and a fixed interval is
+deliberately avoided — a constant cadence is a scraping signature.
+
+### The cookie cache
+
+Reading and decrypting a browser's cookie database takes a moment, and the tool does it on every
+run. The result is cached in the store directory, keyed on **the selection** — the browser, the
+profile and the source — so a cache written for one profile can never be served for another.
+
+```bash
+osint-scraper scrape somehandle --no-cookie-cache   # force a fresh read
+```
+
+The cache expires after `cookies.cache_ttl` seconds (15 minutes by default), and an expired
+cookie is never served from it. The exported file and the cache are written `0600`, and the store
+directory `0700`: these are live session cookies, and they were previously world-readable.
 
 ### Scrape a single post
 
@@ -173,6 +188,26 @@ $ osint-scraper scrape "https://www.threads.com/share/D-VhmZm13/"
                  "reason": "Not an Instagram URL: https://www.threads.com/share/D-VhmZm13/" } ]
 }
 ```
+
+### Instagram surfaces
+
+An Instagram account has more than one feed. The surface is selected by the **target URL**,
+the way `yt-dlp` selects by URL — no extra flag to learn:
+
+| Target | Surface |
+| --- | --- |
+| `instagram.com/<user>/` | the profile's posts |
+| `instagram.com/<user>/tagged/` | the posts the account is tagged in |
+| `instagram.com/stories/<user>/` | the account's active story |
+| `instagram.com/<user>/highlights/` | every highlight, and every item in it |
+
+```bash
+osint-scraper scrape "https://www.instagram.com/stories/somehandle/"
+osint-scraper scrape "https://www.instagram.com/somehandle/highlights/"
+```
+
+Stories and highlights need the browser session, and the manifest records which surface each
+row came from.
 
 ### Full Threads history
 
@@ -262,12 +297,23 @@ out/
 └── manifest.jsonl
 ```
 
-`manifest.jsonl` holds one JSON object per downloaded file and one per crawled post. It is the
-audit trail of a run:
+`manifest.jsonl` holds one JSON object per crawled post, one per **media object** attached to a
+post, and one per downloaded file. It is the audit trail of a run:
 
 ```json
 {"kind":"file","platform":"threads","target":"somehandle","post_id":"4006434140014576097","url":"https://...","path":"threads/somehandle/2026-10-17_20-00-01_DeZtp-TkQHh.jpg","sha256":"…","size":284913}
 ```
+
+A carousel used to be indistinguishable from three unrelated posts — every child shared the
+parent's `post_id`, and its only identity was a `_1` / `_2` / `_3` filename suffix. Each media
+object now gets its own `"media"` row, carrying its position, its kind, its dimensions and the
+platform's own id for it:
+
+```json
+{"kind":"media","platform":"instagram","target":"somehandle","post_id":"4011374380604567319","url":"https://...","metadata":{"index":0,"media_id":"4016734873234909654_787132","kind":"image","width":1080,"height":1350,"mime":"image/jpeg","extension":".jpg","shortcode":"DerQ775"}}
+```
+
+The `"media"` row records what was *discovered*; the `"file"` row records what was *stored*.
 
 ## Configuration
 
@@ -280,6 +326,8 @@ See [`config/default.yaml`](config/default.yaml) for every option with its defau
 ```yaml
 crawl:
   limit: 0                 # 0 = unlimited
+  max_posts_per_target: 5000  # safety ceiling, so a runaway target cannot fill the disk
+  include_text_only: true  # keep posts that carry no media (a caption and nothing else)
   platforms: [instagram, threads]
 download:
   directory: ./osint-output

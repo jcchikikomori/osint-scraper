@@ -60,18 +60,20 @@ def _make_posts_envelope() -> dict[str, object]:
         "text_post_app_info": {"direct_reply_count": 2},
         "carousel_media": [
             {
+                "pk": "carousel_child_1",
                 "image_versions2": {
                     "candidates": [
                         {"url": "https://cdn.example.com/carousel_1.jpg", "width": 800, "height": 800}
                     ]
-                }
+                },
             },
             {
+                "pk": "carousel_child_2",
                 "image_versions2": {
                     "candidates": [
                         {"url": "https://cdn.example.com/carousel_2.jpg", "width": 800, "height": 800}
                     ]
-                }
+                },
             },
         ],
         "user": user,
@@ -284,6 +286,75 @@ def _make_null_user_fixture() -> str:
     return f"<html><body>{script}</body></html>"
 
 
+def _make_quoted_carousel_fixture() -> str:
+    """Return a page whose parent image quotes a two-child carousel.
+
+    The quoting parent already owns one media object, so attaching the quoted
+    carousel must renumber the combined list rather than leave two ``index 0``
+    refs behind.
+    """
+    user = {
+        "username": "mixeduser",
+        "pk": "user_7",
+        "full_name": "Mixed User",
+        "follower_count": 7,
+    }
+    quoted = {
+        "pk": 301,
+        "code": "QuotedCarousel",
+        "caption": {"text": "two children"},
+        "taken_at": 1700000600,
+        "carousel_media": [
+            {
+                "pk": "30101",
+                "image_versions2": {
+                    "candidates": [
+                        {"url": "https://cdn.example.com/quoted_c_1.jpg", "width": 600, "height": 600}
+                    ]
+                },
+            },
+            {
+                "pk": "30102",
+                "video_versions": [
+                    {
+                        "url": "https://cdn.example.com/quoted_c_2.mp4",
+                        "width": 640,
+                        "height": 360,
+                        "bandwidth": 1_000,
+                    }
+                ],
+            },
+        ],
+        "user": {"username": "otheruser", "pk": "user_8"},
+    }
+    parent = {
+        "pk": 300,
+        "code": "MixedQuote",
+        "caption": {"text": "Quoting a carousel"},
+        "taken_at": 1700000700,
+        "image_versions2": {
+            "candidates": [{"url": "https://cdn.example.com/own.jpg", "width": 1080, "height": 1080}]
+        },
+        "text_post_app_info": {
+            "direct_reply_count": 0,
+            "share_info": {"quoted_post": quoted},
+        },
+        "user": user,
+    }
+    payload = {
+        "require": [
+            [
+                "ScheduledServerJS",
+                "handle",
+                None,
+                [{"media": {"edges": [{"node": parent}]}}, {"user": user}],
+            ]
+        ]
+    }
+    script = f'<script type="application/json">{json.dumps(payload)}</script>'
+    return f"<html><body>{script}</body></html>"
+
+
 def _make_post_page_fixture() -> str:
     """Return a post page: the requested post plus the surrounding conversation.
 
@@ -440,6 +511,8 @@ def _handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, text=_make_private_fixture())
     if request.url.path == "/@nulluser":
         return httpx.Response(200, text=_make_null_user_fixture())
+    if request.url.path == "/@mixeduser":
+        return httpx.Response(200, text=_make_quoted_carousel_fixture())
     if request.url.path == "/@testuser/post/VideoOne":
         return httpx.Response(200, text=_make_post_page_fixture())
     if request.url.path == "/@testuser/post/GhostPost":
@@ -535,6 +608,57 @@ async def test_share_link_that_does_not_resolve_is_reported() -> None:
 
         with pytest.raises(ParseError, match="did not resolve to a post"):
             [post async for post in crawler.crawl("https://www.threads.net/share/BROKEN")]
+
+
+async def test_graphql_transport_reports_the_page_ceiling() -> None:
+    """A timeline cut short by the page budget must say so.
+
+    The paging loop used to run out of pages silently, and the result was
+    reported as a complete timeline. A caller cannot tell a short history from
+    a whole one unless the crawler says which it is.
+    """
+    pages = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal pages
+        if request.url.path == "/api/graphql":
+            pages += 1
+            # Always claim there is more, with a cursor that keeps moving.
+            return httpx.Response(
+                200,
+                json=_make_graphql_response(
+                    [_make_graphql_post(f"Post{pages}", 300 + pages, f"page {pages}")],
+                    end_cursor=f"CURSOR{pages}",
+                    has_next_page=True,
+                ),
+            )
+        return httpx.Response(200, text=_make_graphql_session_page())
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        ctx = _make_context(transport, use_graphql=True)
+        ctx.http = client
+        ctx.settings.crawl.max_pages = 3
+        crawler = ThreadsCrawler(ctx)
+        posts = [post async for post in crawler.crawl("testuser")]
+
+    assert pages == 3
+    assert len(posts) == 3
+    assert all(post.metadata.get("truncated") is True for post in posts)
+    reason = posts[0].metadata.get("truncation_reason", "")
+    assert "ceiling" in reason
+
+
+async def test_graphql_transport_does_not_report_truncation_when_complete() -> None:
+    """A timeline that really ended is not reported as cut short."""
+    transport = httpx.MockTransport(_make_graphql_handler())
+    async with httpx.AsyncClient(transport=transport) as client:
+        ctx = _make_context(transport, use_graphql=True)
+        ctx.http = client
+        crawler = ThreadsCrawler(ctx)
+        posts = [post async for post in crawler.crawl("testuser")]
+
+    assert all("truncated" not in post.metadata for post in posts)
 
 
 async def test_graphql_transport_pages_the_whole_timeline() -> None:
@@ -706,6 +830,8 @@ async def test_carousel_yields_multiple_media_refs() -> None:
     carousel = posts["Carousel1"]
     assert len(carousel.media) == 2
     assert all(ref.kind == "image" for ref in carousel.media)
+    assert [ref.index for ref in carousel.media] == [0, 1]
+    assert [ref.media_id for ref in carousel.media] == ["carousel_child_1", "carousel_child_2"]
 
 
 async def test_quoted_post_attached_to_parent() -> None:
@@ -719,12 +845,37 @@ async def test_quoted_post_attached_to_parent() -> None:
 
     assert "Quoted1" not in posts
     quoting = posts["Quoting1"]
-    assert any(ref.url == "https://cdn.example.com/quoted.jpg" for ref in quoting.media)
+    quoted_refs = [ref for ref in quoting.media if ref.url == "https://cdn.example.com/quoted.jpg"]
+    assert quoted_refs
+    assert quoted_refs[0].media_id == "126"
+    assert [ref.index for ref in quoting.media] == list(range(len(quoting.media)))
     assert quoting.metadata["quoted"] == {
         "post_id": "126",
         "username": "otheruser",
         "permalink": "https://www.threads.net/@otheruser/post/Quoted1/",
     }
+
+
+async def test_quoted_carousel_keeps_contiguous_indices_and_child_ids() -> None:
+    """Attaching a quoted carousel renumbers the combined media list."""
+    transport = httpx.MockTransport(_handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        ctx = _make_context(transport)
+        ctx.http = client
+        crawler = ThreadsCrawler(ctx)
+        posts = [post async for post in crawler.crawl("mixeduser")]
+
+    assert len(posts) == 1
+    media = posts[0].media
+    assert [ref.url for ref in media] == [
+        "https://cdn.example.com/own.jpg",
+        "https://cdn.example.com/quoted_c_1.jpg",
+        "https://cdn.example.com/quoted_c_2.mp4",
+    ]
+    assert [ref.index for ref in media] == [0, 1, 2]
+    # The parent owns the first object; the quoted carousel children keep their
+    # own ids so the manifest can say whose media it is.
+    assert [ref.media_id for ref in media] == ["300", "30101", "30102"]
 
 
 async def test_quoted_post_with_null_user_does_not_crash() -> None:

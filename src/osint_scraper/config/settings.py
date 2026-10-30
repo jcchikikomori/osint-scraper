@@ -29,6 +29,15 @@ DEFAULT_USER_AGENT = (
 )
 """Desktop user agent used for HTTP requests."""
 
+DEFAULT_COOKIE_CACHE_TTL = 900.0
+"""Seconds a cached cookie extraction stays usable.
+
+A cookie's *value* rarely changes, but the set of cookies in a browser does,
+and a stale cache would silently serve an old session. The window is kept
+short: the cost of a wrong cache is a failed or mis-scoped run, and the cost
+of a short TTL is only re-reading the browser's cookie database.
+"""
+
 
 @dataclass(slots=True)
 class CookieSettings:
@@ -48,6 +57,9 @@ class CookieSettings:
         domains: Domains cookies are exported for.
         file: Path of an existing Netscape ``cookies.txt`` to use instead.
         store_dir: Directory where exported cookie files are written.
+        use_cache: Whether a cached extraction may be reused instead of reading
+            the browser again. Turn it off to force a fresh read.
+        cache_ttl: How long a cached extraction stays usable, in seconds.
     """
 
     browser: str = "brave"
@@ -64,6 +76,8 @@ class CookieSettings:
     )
     file: str = ""
     store_dir: str = "~/.cache/osint-scraper/cookies"
+    use_cache: bool = True
+    cache_ttl: float = DEFAULT_COOKIE_CACHE_TTL
 
 
 @dataclass(slots=True)
@@ -100,7 +114,9 @@ class CrawlSettings:
 
     Attributes:
         limit: Maximum number of posts per target. ``0`` means unlimited.
-        include_text_only: Whether to keep posts that carry no media.
+        include_text_only: Whether to keep posts that carry no media. A post
+            with no media is only a caption; keeping those is useful for a
+            text-first account and pure noise for a media-first one.
         platforms: Platforms to crawl when a target is given without a platform.
         user_agent: User agent used for HTTP requests.
         max_posts_per_target: Hard ceiling applied after ``limit``.
@@ -115,7 +131,7 @@ class CrawlSettings:
     """
 
     limit: int = 0
-    include_text_only: bool = False
+    include_text_only: bool = True
     platforms: list[str] = field(default_factory=lambda: ["instagram", "threads"])
     user_agent: str = DEFAULT_USER_AGENT
     max_posts_per_target: int = 5000
