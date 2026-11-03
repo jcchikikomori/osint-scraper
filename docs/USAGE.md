@@ -31,7 +31,7 @@ Every command takes `--config`, `--verbose` and `--quiet` as global options. The
 option goes **before** the subcommand:
 
 ```bash
-osint-scraper --config ./osint-scraper.yaml scrape somehandle
+osint-scraper --config ./osint-scraper.yaml scrape natgeo
 ```
 
 ## Targets
@@ -40,9 +40,9 @@ A target is anything the tool can turn into posts: a handle, a profile URL, a po
 link, or — for Instagram — one of a profile's surfaces.
 
 ```bash
-osint-scraper scrape somehandle --platform instagram
-osint-scraper scrape somehandle --platform threads
-osint-scraper scrape somehandle otherhandle --limit 50
+osint-scraper scrape natgeo --platform instagram
+osint-scraper scrape natgeo --platform threads
+osint-scraper scrape natgeo otherhandle --limit 50
 ```
 
 `--platform` restricts the run to one crawler. Without it, the tool tries each configured
@@ -62,9 +62,9 @@ the way `yt-dlp` selects by URL, so there is no extra flag to learn:
 | `instagram.com/<user>/highlights/` | every highlight, and every item in it | Yes |
 
 ```bash
-osint-scraper scrape "https://www.instagram.com/stories/somehandle/"
-osint-scraper scrape "https://www.instagram.com/somehandle/highlights/"
-osint-scraper scrape "https://www.instagram.com/somehandle/tagged/"
+osint-scraper scrape "https://www.instagram.com/stories/natgeo/"
+osint-scraper scrape "https://www.instagram.com/natgeo/highlights/"
+osint-scraper scrape "https://www.instagram.com/natgeo/tagged/"
 ```
 
 Each manifest row records the surface it came from in its `metadata.surface` field.
@@ -79,7 +79,8 @@ profile URL still gets them.
 Paste the link and get that one post — the same idea as `yt-dlp` with a direct video URL:
 
 ```bash
-osint-scraper scrape "https://www.threads.com/share/HydvsaQAW/"
+osint-scraper scrape "https://www.threads.net/@natgeo/post/DfQPPDvFJok/"
+osint-scraper scrape "https://www.threads.com/share/<code>/"
 osint-scraper scrape "https://www.threads.net/@someone/post/AbCdEfG/"
 ```
 
@@ -91,12 +92,12 @@ You do not need `--platform` — a target that a platform does not recognise is 
 platform and tried on the next one:
 
 ```console
-$ osint-scraper scrape "https://www.threads.com/share/HydvsaQAW/"
+$ osint-scraper scrape "https://www.threads.com/share/<code>/"
 {
-  "targets": [ { "platform": "threads", "target": "https://www.threads.com/share/HydvsaQAW/",
+  "targets": [ { "platform": "threads", "target": "https://www.threads.com/share/<code>/",
                  "posts": 1, "downloaded": 1 } ],
   "skipped": [ { "platform": "instagram", "target": "...",
-                 "reason": "Not an Instagram URL: https://www.threads.com/share/HydvsaQAW/" } ]
+                 "reason": "Not an Instagram URL: https://www.threads.com/share/<code>/" } ]
 }
 ```
 

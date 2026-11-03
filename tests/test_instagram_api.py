@@ -29,8 +29,8 @@ _VIDEO_URL = "https://cdn.example.com/video.mp4?bytestart=0"
 def _image_item() -> dict[str, Any]:
     """Return a story item shaped like a verified image item."""
     return {
-        "pk": 4019134249743017444,
-        "code": "DfG1U5MieXk00pbuOlrdDYhH_ki692e1LLrNqo0",
+        "pk": 1234567890123456020,
+        "code": "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
         "taken_at": 1793338154,
         "caption": None,
         "media_type": 1,
@@ -67,8 +67,8 @@ def _video_item(*, with_type_101: bool = True) -> dict[str, Any]:
         ]
     )
     return {
-        "pk": 4019134249743017444,
-        "code": "DfG1U5MieXk00pbuOlrdDYhH_ki692e1LLrNqo0",
+        "pk": 1234567890123456020,
+        "code": "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
         "taken_at": 1793338154,
         "caption": None,
         "media_type": 2,
@@ -138,11 +138,11 @@ def test_build_post_maps_the_story_fields() -> None:
 
     assert post.platform == "instagram"
     assert post.target == "somehandle"
-    assert post.post_id == "4019134249743017444"
-    assert post.shortcode == "DfG1U5MieXk00pbuOlrdDYhH_ki692e1LLrNqo0"
+    assert post.post_id == "1234567890123456020"
+    assert post.shortcode == "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
     assert post.timestamp == 1793338154
     assert post.caption is None
-    assert post.permalink == ("https://www.instagram.com/stories/somehandle/4019134249743017444/")
+    assert post.permalink == ("https://www.instagram.com/stories/somehandle/1234567890123456020/")
     assert post.metadata["surface"] == SURFACE_STORIES
     assert post.metadata["expiring_at"] == 1793424554
     assert len(post.media) == 1
@@ -160,8 +160,8 @@ def test_reel_paths_and_envelopes() -> None:
     """The request paths and response envelopes match Instagram's shape."""
     assert stories_path("123") == "api/v1/feed/reels_media/?reel_ids=123"
     assert highlights_tray_path("123") == "api/v1/highlights/123/highlights_tray/"
-    assert highlight_reel_id("highlight:17945569111203835") == "highlight:17945569111203835"
-    assert highlight_reel_id("17945569111203835") == "highlight:17945569111203835"
+    assert highlight_reel_id("highlight:12345678901234560") == "highlight:12345678901234560"
+    assert highlight_reel_id("12345678901234560") == "highlight:12345678901234560"
 
     tray_payload = {"tray": [{"id": "highlight:1", "title": "One", "media_count": 2}]}
     entries = highlight_tray(tray_payload)

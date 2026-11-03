@@ -21,9 +21,9 @@ def _carousel_post() -> Post:
     return Post(
         platform="instagram",
         target="somehandle",
-        post_id="4011374380604567319",
-        shortcode="DerQ775",
-        permalink="https://www.instagram.com/p/DerQ775/",
+        post_id="1234567890123456001",
+        shortcode="AbCdEfG",
+        permalink="https://www.instagram.com/p/AbCdEfG/",
         caption="Three children",
         timestamp=1700000000,
         media=[
@@ -94,7 +94,7 @@ def test_media_rows_carry_the_media_identity(tmp_path: Path) -> None:
         assert entry["platform"] == "instagram"
         assert entry["target"] == "somehandle"
         assert entry["post_id"] == post.post_id
-        assert entry["metadata"]["shortcode"] == "DerQ775"
+        assert entry["metadata"]["shortcode"] == "AbCdEfG"
         assert entry["timestamp"] == post.timestamp
 
     assert first["url"] == "https://cdn.example.com/child_1.jpg"
@@ -106,7 +106,7 @@ def test_media_rows_carry_the_media_identity(tmp_path: Path) -> None:
         "height": 1350,
         "mime": "image/jpeg",
         "extension": ".jpg",
-        "shortcode": "DerQ775",
+        "shortcode": "AbCdEfG",
     }
     assert second["metadata"]["kind"] == "video"
     assert second["metadata"]["media_id"] == "222"

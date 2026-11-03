@@ -226,7 +226,7 @@ Reading and decrypting a browser's cookie database takes a moment, and the tool 
 otherwise do it on every run. The result is cached in the store directory.
 
 ```bash
-osint-scraper scrape somehandle --no-cookie-cache   # force a fresh read
+osint-scraper scrape natgeo --no-cookie-cache   # force a fresh read
 ```
 
 The cache is keyed on **the selection** — the browser, the profile and the source — so a cache

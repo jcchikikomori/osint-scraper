@@ -73,10 +73,16 @@ Last updated: 2026-10-30
 - [x] `profile()` from the same payload
 - [x] `ParseError` with diagnostics when the envelope changes
 - [x] Unit tests with an inline HTML fixture (no network)
-- [x] Full history is reachable over the **GraphQL transport**. Meta's server-rendered ceiling is
-      roughly the 10–20 most recent posts per profile, but the GraphQL transport walks the whole
-      timeline — **215 posts for `@somehandle` (2023-08-03 → 2026-10-13)** against 10 through the
-      page. The server-rendered page is kept as the fallback.
+- [!] **The GraphQL transport walks far deeper than the rendered page, but it can stop short.**
+      Meta's server-rendered ceiling is roughly the 10–20 most recent posts per profile; the
+      GraphQL transport reaches **215 posts for `@zuck` (2023-08-03 → 2026-10-13)** against 10
+      through the page. **That count is a sliding window, not the account's whole history** — a
+      re-run on 2026-11-03 returned the same 215 posts but with both edges moved
+      (2023-08-04 → 2026-11-01), because one post entered at the top and one left at the bottom.
+      `@natgeo` yields 548+ posts over the same transport, so 215 is not a platform cap. The walk
+      stops when one post's *quoted* post has been deleted, which poisons the whole page the post
+      appears on; the crawler now reports that as an **incomplete** history rather than claiming
+      the walk reached the end. See **R13**.
 - [!] **A private Threads profile yields no posts at all.** Threads does not server-render private
       profiles, so the page carries the user object (`text_post_app_is_private: true`) but no posts.
       The crawler detects this and says so instead of blaming the user agent. The GraphQL transport
@@ -88,7 +94,7 @@ Last updated: 2026-10-30
 - [x] **Full timeline over the GraphQL transport** — `POST /api/graphql`, with the query id
       (`doc_id`) and its exact variables **discovered from the server-rendered page at run
       time** rather than hardcoded, so a bundle rotation is picked up automatically.
-      **Verified live: 215 posts for `@somehandle` (2023-08-03 → 2026-10-13) against 10 through
+      **Verified live: 215 posts for `@zuck` (2023-08-03 → 2026-10-13) against 10 through
       the server-rendered page.**
 - [x] The GraphQL query is **anonymous**: a logged-in request returns a different,
       non-paginating variant of the query, and the session cookie makes the endpoint answer
@@ -219,6 +225,7 @@ are pinned; upgrade deliberately and keep a last-known-good version.
 | R5 | Threads changes the User-Agent gate | SSR returns an empty shell | Multiple UA variants; loud `ParseError` with diagnostics; monitor the mobile UA | Open |
 | R6 | Threads SSR pagination ceiling (~10–20 posts) | Incomplete history | **Resolved** by the GraphQL transport, with the SSR page kept as the fallback | Closed |
 | R12 | The Threads GraphQL transport answers `1675030` for private profiles | Private Threads profiles stay unreadable | Nothing to do yet; the official Threads API needs app review and business verification, and only reads public profiles | Open |
+| R13 | A single deleted quoted post poisons the whole GraphQL page | The timeline walk stops early | **Found and fixed 2026-11-03**: `4686025 "Post Unavailable"` is raised both at the genuine end of a timeline and by an individual post whose *quoted* post was deleted (`description: "The quoted post is no longer available"`, path into `share_info.quoted_post`). The failure is in the serialisation of one edge, so it kills the page it appears on. `ThreadsGraphQLError` now carries the server's `description`, the crawler tells the two cases apart, and the poisoned-page case is reported with the same `truncated` / `truncation_reason` the page ceiling uses — verified live: `@zuck` comes back with all 215 posts flagged, `@nasa` (a genuine end) with none. **Walking past the poisoned page is still not implemented** — the `first: 1` probe proves the cursor is still valid, but the crawler stops there | **Mitigated** |
 | R7 | Rate limiting / account restriction | Collection stops | Jittered delays (never a fixed cadence); low request volume; unauthenticated posture by default | Mitigated |
 | R8 | Meta ToS prohibits automated collection | Account or IP action | Scope to public content, document the legal basis per run, keep the collection log in the manifest | Open |
 | R9 | Threads silently drops the post payload without the right `Accept` header | A 583 KB shell instead of the 960 KB payload, with **zero** posts and no error | Always send `Accept: text/html,application/xhtml+xml,*/*`; the crawler treats "no posts" as a `ParseError` with diagnostics | Mitigated |

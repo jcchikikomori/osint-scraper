@@ -37,6 +37,9 @@ These were stated by the operator and are binding unless they say otherwise.
 - **Run the full test suite, `ruff` and `mypy` before declaring anything done.** All three must
   be clean.
 - **Do not commit or push.** The operator commits by hand so GPG signing works. Stage only.
+- **No real social-media identifiers in the tracked tree.** Not a username, not a numeric account
+  id, not a post or media pk, not a shortcode, not a permalink, not a share code — with the single
+  exception of famous public organisations in documentation examples. See "Identifiers" below.
 - **A re-run must not download anything it already has.** The history is keyed on the media, not
   the URL: Instagram and Threads serve media from a CDN whose URL carries a short-lived signature,
   so the same image arrives under a different full URL every run. Key on the URL *path* without
@@ -133,7 +136,7 @@ Treat them as facts, not as guesses to re-litigate.
   zero them.
 - **The GraphQL transport works — but only anonymously.** `POST /api/graphql` with the
   `doc_id` and variables mined from the server-rendered page's `expectedPreloaders` manifest
-  pages the whole timeline: **215 posts for `@somehandle` (2023-08-03 → 2026-10-13)** against 10
+  pages the whole timeline: **215 posts for `@zuck` (2023-08-03 → 2026-10-13)** against 10
   through the page. `doc_id` rotates whenever Meta ships a bundle, so it must **never** be
   hardcoded — mining it from the page is what makes a rotation a non-event. Facts that cost
   live requests to establish:
@@ -148,6 +151,32 @@ Treat them as facts, not as guesses to re-litigate.
     the body and treat a parse failure as an expired token.
   - The end of the timeline is **not** a clean stop: the last page fails with
     `code: 4686025, summary: "Post Unavailable"`. Treat it as "stop", never as an error.
+- **`4686025` is not only an end-of-timeline marker — it is also a per-post failure, and the
+  two are distinguishable by the server's `description`.** The error carries a `description` and
+  a `path`, and they say which it is:
+  - `"The quoted post is no longer available"`, with a path into
+    `...share_info.quoted_post.text_post_app_info.best_of_threads_info` — a **single post whose
+    quoted post was deleted**. This poisons the whole page, because the server serialises every
+    edge in it. It is *not* the end of the timeline.
+  - **The window slides, so the count is not a property of the account.** On `@zuck` the walk
+    stopped at 215 posts on two different days, but the *window* moved: 2023-08-03 → 2026-10-13
+    on one run, 2023-08-04 → 2026-11-01 on the next. One post entered at the top and one left at
+    the bottom, and the count stayed at 215 both times. A count that is stable while its edges
+    move is a **window**, not a history.
+  - **`@natgeo` yields 548+ posts** over the same transport with no error at all, and `@nasa`
+    yields 199 and ends cleanly with `has_next_page: False`. So 215 is not a platform cap, and
+    `has_next_page` still being `True` when the walk stops is the tell that the stop was not the
+    end.
+  - **A poisoned page can be stepped over.** Requesting the same cursor with `first: 1` returns
+    the post the failed page would have carried — the failure is in the *serialisation of one
+    edge*, not in the cursor. Verified: `first=1` yielded a post dated 2023-08-02, one day older
+    than the window's bottom, while `first=2` and `first=3` on the same cursor still failed.
+    **This is not implemented** — the crawler stops at the poisoned page and says so.
+  - **The crawler distinguishes the two cases and reports truncation.** `ThreadsGraphQLError`
+    carries the server's `description`, and a deleted-quoted-post failure sets the same
+    `truncated` / `truncation_reason` the page ceiling sets. Verified live: `@zuck` comes back
+    with all 215 posts flagged `truncated`, `@nasa` — which ends genuinely — comes back with
+    none.
 - **Unauthenticated history is capped** at roughly the 10–20 most recent posts per profile.
 - **Threads' history ceiling is a rendering limit, not an auth limit.** The server-rendered page
   returns the same ~10 posts with and without a session. The GraphQL transport (M2/R2) is the only
@@ -299,6 +328,74 @@ file is gone.
 
 `osint-scraper cooldown` shows the state; `osint-scraper cooldown --clear` overrides it
 deliberately.
+
+## Identifiers: the rule
+
+**No real username, handle, numeric account id, post id, media id or shortcode of a real account
+may appear in any text file in this repository.** That covers `CLAUDE.md`, `README.md`,
+`DISCLAIMER.md` and everything under `docs/` — and it covers the source and the tests too, because
+the same rule protects the same thing.
+
+This is a legal constraint, not a style preference, and it is why the rule exists:
+
+- A handle or an account id is **personal data**. Naming one in a published repository attributes
+  a collection to a named individual, and it can be used to find content that was collected
+  privately, was deleted, or was never meant to be published.
+- A **post id or a shortcode is a pointer to an account**. It resolves to the profile that owns
+  it. Scrubbing the handle but keeping the shortcode leaks the same thing.
+- The repository is **public**. "It is in the source code" is not a defence; it is the problem.
+
+### What counts as a real identifier
+
+| Kind | Example of a real one |
+| --- | --- |
+| Username / handle | `natgeo` (a handle that is not a public org) |
+| Numeric account id | Instagram `ds_user_id`, a Threads `userID` |
+| Post id / media id | `post_id`, `media_id`, an `pk` |
+| Shortcode | the code in `instagram.com/p/<code>/` |
+| Permalink or share code | `…/p/<shortcode>/`, `…/share/<code>/` |
+| Highlight id | `highlight:<numeric>` |
+
+### The exceptions, and only these
+
+- **Public organisation or public-figure accounts, used as documentation examples.** `@natgeo`,
+  `@nasa` and similar are fine to name in a README or a doc: they are public, they are not the
+  operator's own account, and a worked example has to name *something* to be worth reading.
+- **Obviously synthetic placeholders.** `AbCdEfG`, `1234567890123456001`, `somehandle`,
+  `example.com`. These are preferred over a real value, because they cannot be mistaken for a
+  real collection.
+- **Protocol constants.** A GraphQL `doc_id` is a public, rotating Meta constant and carries no
+  personal information. It is not an identifier and may be written down.
+
+### The rules
+
+1. **Never the operator's own account.** Not the handle, not the numeric id, not a post id from
+   it. The operator's Instagram and Threads accounts are private and are the target of the
+   authenticated tests, so any identifier from them is the most sensitive thing in this project.
+2. **Never a real third-party account either.** A target someone else owns is exactly the case
+   the disclaimer is about. Name the *structure* — "a private profile", "a public organisation" —
+   not the account.
+3. **One identifier is enough to leak.** If a shortcode appears anywhere, the account it belongs
+   to is one API call away. Scrub the whole set: handle, numeric id, post id, shortcode, permalink.
+4. **Redact at the point of collection.** When a live request yields an identifier, do not write
+   it to a file, a log, a test fixture or a commit message. Write the structure instead.
+5. **Check before committing.** The scrub is mechanical and easy to get wrong:
+
+   ```bash
+   git grep -nIE '[0-9]{11,19}' -- .          # ids, pks, shortcodes
+   git grep -nIE 'instagram\.com/[A-Za-z0-9_]+|threads\.(net|com)/@?[A-Za-z0-9_]+' -- .
+   ```
+
+   Every hit must be a placeholder, a timestamp, a protocol constant, or a sanctioned public
+   example. Read each one; do not skim.
+
+### Historical leaks
+
+Identifiers that were committed before this rule existed are still in the git history, and
+removing them from the working tree does not remove them from the published repository. If a real
+identifier was ever committed, the fix is a **history rewrite** (`git filter-repo`) followed by a
+force-push, not a normal commit — and the operator decides that, because it rewrites published
+history.
 
 ## Collected identifiers
 

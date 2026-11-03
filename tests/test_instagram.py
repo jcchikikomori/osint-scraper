@@ -541,8 +541,8 @@ async def test_sidecar_children_are_built_from_the_parent_carousel_media(
         typename="GraphSidecar",
         carousel_media=[
             {
-                "id": "4016734873234909654_787132",
-                "pk": 4016734873234909654,
+                "id": "1234567890123456010_1234567890",
+                "pk": 1234567890123456010,
                 "media_type": 1,
                 "image_versions2": {
                     "candidates": [
@@ -552,8 +552,8 @@ async def test_sidecar_children_are_built_from_the_parent_carousel_media(
                 },
             },
             {
-                "id": "4016734895371392264_787132",
-                "pk": 4016734895371392264,
+                "id": "1234567890123456011_1234567890",
+                "pk": 1234567890123456011,
                 "media_type": 2,
                 "video_versions": [
                     {"url": "https://cdn.example.com/c2.mp4", "width": 720, "height": 900},
@@ -578,8 +578,8 @@ async def test_sidecar_children_are_built_from_the_parent_carousel_media(
     assert len(media) == 2
     assert [ref.index for ref in media] == [0, 1]
     assert [ref.media_id for ref in media] == [
-        "4016734873234909654_787132",
-        "4016734895371392264_787132",
+        "1234567890123456010_1234567890",
+        "1234567890123456011_1234567890",
     ]
     assert [ref.kind for ref in media] == ["image", "video"]
     # The largest candidate wins, and the dimensions come with it.
@@ -639,7 +639,7 @@ async def test_sidecar_children_come_from_the_cached_full_metadata(
         _full_metadata_dict={
             "carousel_media": [
                 {
-                    "id": "4016734873234909654_787132",
+                    "id": "1234567890123456010_1234567890",
                     "media_type": 2,
                     "video_versions": [
                         {"url": "https://cdn.example.com/v1.mp4", "width": 720, "height": 900},
@@ -658,7 +658,7 @@ async def test_sidecar_children_come_from_the_cached_full_metadata(
 
     media = results[0].media
     assert len(media) == 1
-    assert media[0].media_id == "4016734873234909654_787132"
+    assert media[0].media_id == "1234567890123456010_1234567890"
     assert media[0].kind == "video"
     assert (media[0].width, media[0].height) == (720, 900)
 

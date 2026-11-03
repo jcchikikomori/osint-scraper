@@ -34,25 +34,25 @@ rather than crashing.
 
 ```bash
 # Scrape a profile's public posts
-osint-scraper scrape somehandle --platform instagram --output ./out
+osint-scraper scrape natgeo --platform instagram --output ./out
 
 # Scrape a Threads profile — the whole timeline, not just the recent posts
-osint-scraper scrape somehandle --platform threads --output ./out
+osint-scraper scrape natgeo --platform threads --output ./out
 
 # Scrape one post from a direct or share link
-osint-scraper scrape "https://www.threads.com/share/HydvsaQAW/" --output ./out
+osint-scraper scrape "https://www.threads.net/@natgeo/post/DfQPPDvFJok/" --output ./out
 
 # Use the browser session: reaches private profiles, stories and highlights
-osint-scraper scrape somehandle --platform instagram --browser brave --profile "flatpak:Profile 1"
+osint-scraper scrape natgeo --platform instagram --browser brave --profile "flatpak:Profile 1"
 
 # Ignore the browser session entirely
-osint-scraper scrape somehandle --platform instagram --no-cookies
+osint-scraper scrape natgeo --platform instagram --no-cookies
 
 # Discovery only — list what is there without fetching the media
-osint-scraper scrape somehandle --platform threads --no-download
+osint-scraper scrape natgeo --platform threads --no-download
 ```
 
-The handles above are placeholders — replace them with the account you want. `--platform` is
+The handle above is a public example — replace it with the account you want. `--platform` is
 optional: a target a platform does not recognise is skipped for that platform and tried on the
 next one, so a Threads link does not need it.
 
@@ -62,7 +62,7 @@ The surface is selected by the **target URL**, the way `yt-dlp` selects by URL.
 
 | Target | Gets |
 | --- | --- |
-| `somehandle` | The profile's posts |
+| `natgeo` | The profile's posts |
 | `instagram.com/<user>/` | The profile's posts |
 | `instagram.com/<user>/tagged/` | The posts the account is tagged in |
 | `instagram.com/stories/<user>/` | The account's active story |
@@ -90,12 +90,12 @@ The surface is selected by the **target URL**, the way `yt-dlp` selects by URL.
 ```text
 out/
 ├── instagram/
-│   └── somehandle/
-│       ├── 2026-10-17_20-00-01_DeZtp-TkQHh.jpg
-│       ├── 2026-10-17_20-00-01_DeZtp-TkQHh.json
+│   └── natgeo/
+│       ├── 2026-10-17_20-00-01_XyZaBc-De.jpg
+│       ├── 2026-10-17_20-00-01_XyZaBc-De.json
 │       └── ...
 ├── threads/
-│   └── somehandle/
+│   └── natgeo/
 │       └── ...
 └── manifest.jsonl
 ```

@@ -19,6 +19,11 @@ import pytest
 from osint_scraper.config.settings import Settings
 from osint_scraper.crawlers.base import CrawlContext
 from osint_scraper.crawlers.threads import ThreadsCrawler, normalize_target, parse_target
+from osint_scraper.crawlers.threads_api import (
+    ThreadsGraphQLError,
+    ThreadsGraphQLSession,
+    fetch_graphql_page,
+)
 from osint_scraper.exceptions import ParseError, UnsupportedTargetError
 from osint_scraper.models import ProfileInfo
 
@@ -427,7 +432,7 @@ def _make_graphql_session_page() -> str:
         "variables": {
             "allow_page_info_for_lox_user": True,
             "first": 4,
-            "userID": "63055343223",
+            "userID": "12345678901",
         },
         "queryName": "BarcelonaProfileThreadsTabDirectQuery",
     }
@@ -472,6 +477,25 @@ def _make_graphql_response(
             }
         }
     }
+
+
+def _make_graphql_error_response(
+    *,
+    description: str | None = None,
+    path: list[object] | None = None,
+) -> dict[str, object]:
+    """Return a GraphQL error envelope for a 4686025 response."""
+    error: dict[str, object] = {
+        "code": 4686025,
+        "summary": "PostUnavailable",
+        "message": "The post is unavailable",
+        "path": ["mediaData", "edges"],
+    }
+    if description is not None:
+        error["description"] = description
+    if path is not None:
+        error["path"] = path
+    return {"errors": [error]}
 
 
 def _make_graphql_handler() -> Any:
@@ -556,16 +580,16 @@ def test_parse_target_recognises_every_form() -> None:
     assert post.share_url is None
     assert post.is_single_post
 
-    share = parse_target("https://www.threads.com/share/HydvsaQAW/")
-    assert share.post_code == "HydvsaQAW"
-    assert share.share_url == "https://www.threads.com/share/HydvsaQAW/"
+    share = parse_target("https://www.threads.com/share/AbCdEfGh/")
+    assert share.post_code == "AbCdEfGh"
+    assert share.share_url == "https://www.threads.com/share/AbCdEfGh/"
     assert share.is_single_post
 
 
 def test_normalize_target_refuses_a_share_link() -> None:
     """A share link's author is only known after the redirect."""
     with pytest.raises(UnsupportedTargetError, match="share link"):
-        normalize_target("https://www.threads.com/share/HydvsaQAW/")
+        normalize_target("https://www.threads.com/share/AbCdEfGh/")
 
 
 async def test_post_url_yields_only_that_post() -> None:
@@ -649,6 +673,151 @@ async def test_graphql_transport_reports_the_page_ceiling() -> None:
     assert "ceiling" in reason
 
 
+async def test_graphql_transport_reports_a_deleted_quoted_post_as_truncation() -> None:
+    """A page poisoned by a deleted quoted post is not the end of the timeline.
+
+    The server ends the walk at a post whose quoted post was deleted even
+    though more history exists behind it, so the result has to be reported as
+    incomplete rather than as a complete timeline.
+    """
+    quoted_path: list[object] = [
+        "mediaData",
+        "edges",
+        1,
+        "node",
+        "thread_items",
+        0,
+        "post",
+        "text_post_app_info",
+        "share_info",
+        "quoted_post",
+        "text_post_app_info",
+        "best_of_threads_info",
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/graphql":
+            body = dict(parse_qsl(request.content.decode()))
+            variables = json.loads(body["variables"])
+            if variables.get("after") == "CURSOR2":
+                return httpx.Response(
+                    200,
+                    json=_make_graphql_error_response(
+                        description="The quoted post is no longer available",
+                        path=quoted_path,
+                    ),
+                )
+            return httpx.Response(
+                200,
+                json=_make_graphql_response(
+                    [_make_graphql_post("First", 301, "first page")],
+                    end_cursor="CURSOR2",
+                    has_next_page=True,
+                ),
+            )
+        return httpx.Response(200, text=_make_graphql_session_page())
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        ctx = _make_context(transport, use_graphql=True)
+        ctx.http = client
+        crawler = ThreadsCrawler(ctx)
+        posts = [post async for post in crawler.crawl("testuser")]
+
+    assert len(posts) == 1
+    assert posts[0].metadata.get("truncated") is True
+    reason = posts[0].metadata.get("truncation_reason", "")
+    assert "quoted post" in reason
+    assert "deleted" in reason
+
+
+async def test_graphql_transport_detects_a_poisoned_page_by_its_path() -> None:
+    """The error path alone identifies the deleted-quoted-post case."""
+    quoted_path: list[object] = ["mediaData", "edges", 1, "quoted_post"]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/graphql":
+            body = dict(parse_qsl(request.content.decode()))
+            variables = json.loads(body["variables"])
+            if variables.get("after") == "CURSOR2":
+                return httpx.Response(200, json=_make_graphql_error_response(path=quoted_path))
+            return httpx.Response(
+                200,
+                json=_make_graphql_response(
+                    [_make_graphql_post("First", 301, "first page")],
+                    end_cursor="CURSOR2",
+                    has_next_page=True,
+                ),
+            )
+        return httpx.Response(200, text=_make_graphql_session_page())
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        ctx = _make_context(transport, use_graphql=True)
+        ctx.http = client
+        crawler = ThreadsCrawler(ctx)
+        posts = [post async for post in crawler.crawl("testuser")]
+
+    assert all(post.metadata.get("truncated") is True for post in posts)
+
+
+async def test_graphql_transport_treats_a_plain_4686025_as_the_end() -> None:
+    """The genuine end of a timeline is still not reported as cut short."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/graphql":
+            body = dict(parse_qsl(request.content.decode()))
+            variables = json.loads(body["variables"])
+            if variables.get("after") == "CURSOR2":
+                return httpx.Response(200, json=_make_graphql_error_response())
+            return httpx.Response(
+                200,
+                json=_make_graphql_response(
+                    [_make_graphql_post("First", 301, "first page")],
+                    end_cursor="CURSOR2",
+                    has_next_page=True,
+                ),
+            )
+        return httpx.Response(200, text=_make_graphql_session_page())
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        ctx = _make_context(transport, use_graphql=True)
+        ctx.http = client
+        crawler = ThreadsCrawler(ctx)
+        posts = [post async for post in crawler.crawl("testuser")]
+
+    assert len(posts) == 1
+    assert all("truncated" not in post.metadata for post in posts)
+
+
+async def test_graphql_error_carries_the_server_description() -> None:
+    """The description distinguishes the two meanings of 4686025."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_make_graphql_error_response(
+                description="The quoted post is no longer available",
+            ),
+        )
+
+    transport = httpx.MockTransport(handler)
+    session = ThreadsGraphQLSession(
+        lsd="token",
+        doc_id="28967344372926951",
+        query_name="BarcelonaProfileThreadsTabDirectQuery",
+        variables={},
+        user_id="12345678901",
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(ThreadsGraphQLError) as excinfo:
+            await fetch_graphql_page(client, session)
+
+    assert excinfo.value.code == 4686025
+    assert excinfo.value.description == "The quoted post is no longer available"
+
+
 async def test_graphql_transport_does_not_report_truncation_when_complete() -> None:
     """A timeline that really ended is not reported as cut short."""
     transport = httpx.MockTransport(_make_graphql_handler())
@@ -698,7 +867,7 @@ async def test_graphql_transport_sends_the_discovered_doc_id() -> None:
     assert body["lsd"] == "AbCdEfToken"
     assert body["fb_api_req_friendly_name"] == "BarcelonaProfileThreadsTabDirectQuery"
     variables = json.loads(body["variables"])
-    assert variables["userID"] == "63055343223"
+    assert variables["userID"] == "12345678901"
     assert variables["first"] == 4
     assert "after" not in variables
 

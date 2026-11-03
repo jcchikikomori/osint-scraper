@@ -64,6 +64,29 @@ _SSR_TRUNCATION = "Threads unauthenticated profile pages return roughly the 10-2
 """Why a server-rendered profile result is incomplete."""
 
 
+def _is_deleted_quoted_post_error(exc: ThreadsGraphQLError) -> bool:
+    """Return whether ``exc`` is the deleted-quoted-post flavour of 4686025.
+
+    4686025 means two different things: the genuine end of a timeline, and a
+    single post on the page whose quoted post was deleted.  The server
+    serialises every edge on the page, so the second case ends the walk early
+    rather than at the end of the history.  The ``description`` names the
+    cause; the ``path`` reaches into ``quoted_post`` when it is absent.
+
+    Args:
+        exc: The error the endpoint returned.
+
+    Returns:
+        ``True`` when a deleted quoted post poisoned the page.
+    """
+    description = exc.description if isinstance(exc.description, str) else ""
+    lowered = description.lower()
+    if "quoted post" in lowered and "no longer available" in lowered:
+        return True
+    path = exc.path
+    return isinstance(path, list) and "quoted_post" in path
+
+
 @dataclass(frozen=True, slots=True)
 class ThreadsTarget:
     """A parsed Threads target.
@@ -613,7 +636,7 @@ class ThreadsCrawler(Crawler):
                 )
                 return await self._fetch_ssr_posts(username), _SSR_TRUNCATION
             try:
-                entries, hit_ceiling = await self._fetch_graphql_posts(username, session, limit)
+                entries, truncation_reason = await self._fetch_graphql_posts(username, session, limit)
             except ThreadsGraphQLError as exc:
                 self.log.warning(
                     "the Threads GraphQL transport failed (%s); falling back to the profile page",
@@ -626,12 +649,7 @@ class ThreadsCrawler(Crawler):
                 )
             else:
                 if entries:
-                    if hit_ceiling:
-                        return entries, (
-                            f"the run stopped at the {self.ctx.settings.crawl.max_pages}-page "
-                            "ceiling, so the timeline is incomplete"
-                        )
-                    return entries, None
+                    return entries, truncation_reason
                 self.log.warning(
                     "the Threads GraphQL transport returned no posts for @%s; "
                     "falling back to the profile page",
@@ -642,7 +660,7 @@ class ThreadsCrawler(Crawler):
 
     async def _fetch_graphql_posts(
         self, username: str, session: ThreadsGraphQLSession, limit: int | None = None
-    ) -> tuple[list[tuple[Post, dict[str, Any]]], bool]:
+    ) -> tuple[list[tuple[Post, dict[str, Any]]], str | None]:
         """Page a profile's whole timeline over the GraphQL transport.
 
         The cursor chain is strictly sequential -- each page names the next --
@@ -655,7 +673,8 @@ class ThreadsCrawler(Crawler):
 
         Returns:
             The posts authored by ``username``, each paired with its raw dict,
-            and whether the page budget ran out before the timeline did.
+            and the reason the result is incomplete -- ``None`` when it is
+            complete.
 
         Raises:
             ParseError: When the profile is private.
@@ -666,7 +685,7 @@ class ThreadsCrawler(Crawler):
         entries: list[tuple[Post, dict[str, Any]]] = []
         cursor: str | None = None
         refreshed = False
-        hit_ceiling = False
+        truncation_reason: str | None = None
 
         for page_number in range(1, max_pages + 1):
             await self._apply_politeness()
@@ -678,9 +697,23 @@ class ThreadsCrawler(Crawler):
                 )
             except ThreadsGraphQLError as exc:
                 if exc.code == GRAPHQL_POST_UNAVAILABLE:
-                    # The server walked into a post it cannot resolve.  That is
-                    # the end of the timeline, not a failure.
-                    self.log.debug("reached the end of the timeline of @%s", username)
+                    if _is_deleted_quoted_post_error(exc):
+                        # One deleted quoted post poisons every edge on the
+                        # page, so the walk stops with more history behind it.
+                        # Unlike the genuine end of the timeline, this result
+                        # is incomplete and the caller has to say so.
+                        truncation_reason = (
+                            "the timeline walk stopped at a post whose quoted post was "
+                            "deleted, so the history is incomplete"
+                        )
+                        self.log.warning(
+                            "stopped at a post with a deleted quoted post on @%s; the timeline is incomplete",
+                            username,
+                        )
+                    else:
+                        # The server walked past the oldest post it has.  That
+                        # is the end of the timeline, not a failure.
+                        self.log.debug("reached the end of the timeline of @%s", username)
                     break
                 if exc.code == GRAPHQL_PRIVATE_PROFILE:
                     raise ParseError(
@@ -725,14 +758,16 @@ class ThreadsCrawler(Crawler):
             # The loop ran out of pages without the server saying there was no
             # more.  The timeline was cut short, and the caller has to say so
             # rather than report an incomplete result as a complete one.
-            hit_ceiling = True
+            truncation_reason = (
+                f"the run stopped at the {max_pages}-page ceiling, so the timeline is incomplete"
+            )
             self.log.warning(
                 "stopped at the %d-page ceiling for @%s; the timeline is incomplete",
                 max_pages,
                 username,
             )
 
-        return entries, hit_ceiling
+        return entries, truncation_reason
 
     async def _fetch_ssr_posts(
         self, username: str, html: str | None = None

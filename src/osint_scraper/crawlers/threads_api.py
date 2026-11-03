@@ -59,6 +59,10 @@ class ThreadsGraphQLError(Exception):
         summary: The short error summary.
         message: The human-readable message.
         path: The error path inside the query, when the server gave one.
+        description: The server's longer explanation, when it gave one.  It is
+            what distinguishes some errors that share a code -- a deleted
+            quoted post is reported with the same code as the end of a
+            timeline.
     """
 
     def __init__(
@@ -67,6 +71,7 @@ class ThreadsGraphQLError(Exception):
         summary: Any = None,
         message: Any = None,
         path: Any = None,
+        description: Any = None,
     ) -> None:
         """Store the error fields and build a readable message.
 
@@ -75,11 +80,13 @@ class ThreadsGraphQLError(Exception):
             summary: The short error summary.
             message: The human-readable message.
             path: The error path inside the query.
+            description: The server's longer explanation of the error.
         """
         self.code = code
         self.summary = summary
         self.message = message
         self.path = path
+        self.description = description
         super().__init__(f"{code} {summary}: {message} path={path}")
 
 
@@ -407,6 +414,7 @@ async def fetch_graphql_page(
                 summary=first.get("summary"),
                 message=first.get("message"),
                 path=first.get("path"),
+                description=first.get("description"),
             )
         raise ThreadsGraphQLError(summary="UnknownError", message=str(first))
 

@@ -87,7 +87,7 @@ same image reposted on Instagram and Threads is kept once.
 The download summary partitions the media items:
 
 ```console
-$ osint-scraper scrape somehandle --platform threads
+$ osint-scraper scrape natgeo --platform threads
 {
   "downloads": { "downloaded": 0, "skipped": 2, "duplicates": 0, "resumed": 0, "failed": 0 }
 }
@@ -109,12 +109,12 @@ $ osint-scraper scrape somehandle --platform threads
 ```text
 out/
 ├── instagram/
-│   └── somehandle/
-│       ├── 2026-10-17_20-00-01_DeZtp-TkQHh.jpg
-│       ├── 2026-10-17_20-00-01_DeZtp-TkQHh.json
+│   └── natgeo/
+│       ├── 2026-10-17_20-00-01_XyZaBc-De.jpg
+│       ├── 2026-10-17_20-00-01_XyZaBc-De.json
 │       └── ...
 ├── threads/
-│   └── somehandle/
+│   └── natgeo/
 │       └── ...
 └── manifest.jsonl
 ```
@@ -131,7 +131,7 @@ a post, and one per downloaded file. It is the audit trail of a run, and it is a
 ### The `post` row
 
 ```json
-{"kind":"post","platform":"threads","target":"somehandle","post_id":"4006434140014576097","url":"https://...","timestamp":1758000000,"metadata":{"shortcode":"DfCjvSCEbct","caption":"…","media_count":1,"saved":1}}
+{"kind":"post","platform":"threads","target":"natgeo","post_id":"1234567890123456002","url":"https://...","timestamp":1758000000,"metadata":{"shortcode":"GhIjKlMnO","caption":"…","media_count":1,"saved":1}}
 ```
 
 ### The `media` row
@@ -141,7 +141,7 @@ child shared the parent's `post_id`, and its only identity was a `_1` / `_2` / `
 suffix. The `media` row gives each child its own identity.
 
 ```json
-{"kind":"media","platform":"instagram","target":"somehandle","post_id":"4011374380604567319","url":"https://...","timestamp":1729958400,"metadata":{"index":0,"media_id":"4016734873234909654_787132","kind":"image","width":1080,"height":1350,"mime":"image/jpeg","extension":".jpg","shortcode":"DerQ775"}}
+{"kind":"media","platform":"instagram","target":"natgeo","post_id":"1234567890123456001","url":"https://...","timestamp":1729958400,"metadata":{"index":0,"media_id":"1234567890123456010_1234567890","kind":"image","width":1080,"height":1350,"mime":"image/jpeg","extension":".jpg","shortcode":"AbCdEfG"}}
 ```
 
 | Field | Meaning |
@@ -157,7 +157,7 @@ The `media` row records what was **discovered**; the `file` row records what was
 ### The `file` row
 
 ```json
-{"kind":"file","platform":"threads","target":"somehandle","post_id":"4006434140014576097","url":"https://...","path":"threads/somehandle/2026-10-17_20-00-01_DfCjvSCEbct.mp4","sha256":"…","size":284913,"timestamp":1758000000}
+{"kind":"file","platform":"threads","target":"natgeo","post_id":"1234567890123456002","url":"https://...","path":"threads/natgeo/2026-10-17_20-00-01_GhIjKlMnO.mp4","sha256":"…","size":284913,"timestamp":1758000000}
 ```
 
 `path` is relative to the output root. `sha256` is the digest of the bytes on disk, and it is
@@ -172,20 +172,20 @@ with a text editor or to feed to another tool.
 ```json
 {
   "platform": "instagram",
-  "target": "somehandle",
-  "post_id": "4011374380604567319",
-  "shortcode": "DerQ775Ca8XDCVVjm_Qc5XAlbw2g9icVp-7F7Y0",
-  "permalink": "https://www.instagram.com/p/DerQ775Ca8XDCVVjm_Qc5XAlbw2g9icVp-7F7Y0/",
+  "target": "natgeo",
+  "post_id": "1234567890123456001",
+  "shortcode": "AbCdEfGhIjKlMnOpQrStUvWx",
+  "permalink": "https://www.instagram.com/p/AbCdEfGhIjKlMnOpQrStUvWx/",
   "caption": "…",
   "timestamp": 1792384311,
   "media": [],
-  "metadata": { "like_count": 34, "typename": "GraphSidecar", "owner_username": "somehandle" },
+  "metadata": { "like_count": 34, "typename": "GraphSidecar", "owner_username": "natgeo" },
   "quoted_post_id": null,
   "parent_post_id": null,
   "files": [
     {
       "url": "https://…",
-      "path": "instagram/somehandle/2026-10-19_04-31-51_DerQ775….jpg",
+      "path": "instagram/natgeo/2026-10-19_04-31-51_AbCdEfG….jpg",
       "sha256": "…",
       "size": 1059358,
       "kind": "image",
